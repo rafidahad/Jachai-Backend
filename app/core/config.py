@@ -5,7 +5,7 @@ from functools import lru_cache
 from typing import Annotated
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -17,40 +17,109 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_name: str = "JachAI Backend"
+    app_name: str = Field(default="JachAI Backend", validation_alias=AliasChoices("APP_NAME"))
     app_version: str = "0.1.0"
-    app_env: str = "development"
-    debug: bool = False
-    api_v1_prefix: str = "/api/v1"
-    database_url: str = Field(alias="DATABASE_URL")
-    database_sync_url: str = Field(alias="DATABASE_SYNC_URL")
-    redis_url: str = Field(alias="REDIS_URL")
-    nvidia_api_key: str = Field(alias="NVIDIA_API_KEY")
-    nvidia_base_url: str = Field(alias="NVIDIA_BASE_URL")
-    nvidia_llm_model: str | None = Field(default=None, alias="NVIDIA_LLM_MODEL")
-    nvidia_reasoning_model: str | None = Field(default=None, alias="NVIDIA_REASONING_MODEL")
-    nvidia_vision_model: str | None = Field(default=None, alias="NVIDIA_VISION_MODEL")
-    nvidia_enable_vision_fallback: bool = Field(default=False, alias="NVIDIA_ENABLE_VISION_FALLBACK")
-    nvidia_rpm_safety_limit: int = Field(default=30, alias="NVIDIA_MAX_RPM")
-    nvidia_timeout_seconds: float = Field(default=60.0, alias="NVIDIA_TIMEOUT_SECONDS")
-    embedding_model: str = Field(default="BAAI/bge-m3", alias="EMBEDDING_MODEL")
-    embedding_dim: int = Field(default=1024, alias="EMBEDDING_DIM")
-    internal_api_key: str = Field(alias="INTERNAL_API_KEY")
+    app_env: str = Field(default="development", validation_alias=AliasChoices("APP_ENV", "ENVIRONMENT"))
+    debug: bool = Field(default=False, validation_alias=AliasChoices("DEBUG"))
+    api_v1_prefix: str = Field(default="/api/v1", validation_alias=AliasChoices("API_V1_PREFIX"))
+    database_url: str = Field(validation_alias=AliasChoices("DATABASE_URL"))
+    database_sync_url: str = Field(validation_alias=AliasChoices("DATABASE_SYNC_URL"))
+    redis_url: str = Field(validation_alias=AliasChoices("REDIS_URL"))
+    nvidia_api_key: str = Field(validation_alias=AliasChoices("NVIDIA_API_KEY"))
+    nvidia_base_url: str = Field(validation_alias=AliasChoices("NVIDIA_BASE_URL"))
+    google_fact_check_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GOOGLE_FACT_CHECK_API_KEY"),
+    )
+    google_fact_check_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("GOOGLE_FACT_CHECK_ENABLED"),
+    )
+    nvidia_llm_model: str | None = Field(default=None, validation_alias=AliasChoices("NVIDIA_LLM_MODEL"))
+    nvidia_reasoning_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("NVIDIA_REASONING_MODEL"),
+    )
+    nvidia_claim_extraction_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("NVIDIA_CLAIM_EXTRACTION_MODEL"),
+    )
+    nvidia_rerank_model: str | None = Field(
+        default="nvidia/rerank-qa-mistral-4b",
+        validation_alias=AliasChoices("NVIDIA_RERANK_MODEL"),
+    )
+    nvidia_vision_model: str | None = Field(default=None, validation_alias=AliasChoices("NVIDIA_VISION_MODEL"))
+    nvidia_enable_vision_fallback: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("NVIDIA_ENABLE_VISION_FALLBACK", "ENABLE_VISION_FALLBACK"),
+    )
+    nvidia_rpm_safety_limit: int = Field(default=30, validation_alias=AliasChoices("NVIDIA_MAX_RPM"))
+    nvidia_max_uncached_claims_per_minute: int = Field(
+        default=15,
+        validation_alias=AliasChoices("NVIDIA_MAX_UNCACHED_CLAIMS_PER_MINUTE"),
+    )
+    nvidia_timeout_seconds: float = Field(default=60.0, validation_alias=AliasChoices("NVIDIA_TIMEOUT_SECONDS"))
+    embedding_model: str = Field(default="BAAI/bge-m3", validation_alias=AliasChoices("EMBEDDING_MODEL"))
+    embedding_dim: int = Field(
+        default=1024,
+        validation_alias=AliasChoices("EMBEDDING_DIM", "EMBEDDING_DIMENSION"),
+    )
+    embedding_device: str = Field(default="cpu", validation_alias=AliasChoices("EMBEDDING_DEVICE"))
+    internal_api_key: str = Field(validation_alias=AliasChoices("INTERNAL_API_KEY"))
     backend_cors_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=list,
-        alias="BACKEND_CORS_ORIGINS",
+        validation_alias=AliasChoices("BACKEND_CORS_ORIGINS", "CORS_ORIGINS"),
     )
     log_level: str = "INFO"
     auto_create_tables: bool = True
-    result_cache_ttl_seconds: int = 60 * 60 * 24
-    duplicate_cache_ttl_seconds: int = 60 * 60 * 48
+    result_cache_ttl_seconds: int = Field(
+        default=60 * 60 * 24,
+        validation_alias=AliasChoices("RESULT_CACHE_TTL_SECONDS", "CLAIM_CACHE_TTL_SECONDS"),
+    )
+    duplicate_cache_ttl_seconds: int = Field(
+        default=60 * 60 * 48,
+        validation_alias=AliasChoices("DUPLICATE_CACHE_TTL_SECONDS", "CLAIM_CACHE_TTL_SECONDS"),
+    )
     job_status_ttl_seconds: int = 60 * 60 * 24
     claim_rate_limit_per_minute: int = 20
     internal_rate_limit_per_minute: int = 60
-    evidence_top_k: int = 5
-    ocr_min_characters: int = 12
-    ocr_languages: str = "eng+ben+hin"
+    pgvector_top_k: int = Field(default=20, validation_alias=AliasChoices("PGVECTOR_TOP_K"))
+    final_evidence_top_k: int = Field(default=5, validation_alias=AliasChoices("FINAL_EVIDENCE_TOP_K"))
+    rerank_min_candidates: int = Field(default=6, validation_alias=AliasChoices("RERANK_MIN_CANDIDATES"))
+    min_relevant_similarity: float = Field(default=0.60, validation_alias=AliasChoices("MIN_RELEVANT_SIMILARITY"))
+    ocr_engine: str = Field(default="tesseract", validation_alias=AliasChoices("OCR_ENGINE"))
+    ocr_min_characters: int = Field(default=10, validation_alias=AliasChoices("OCR_MIN_CHARACTERS"))
+    ocr_languages: str = Field(default="eng+ben+hin", validation_alias=AliasChoices("OCR_LANGUAGES"))
+    max_image_size_mb: int = Field(default=8, validation_alias=AliasChoices("MAX_IMAGE_SIZE_MB"))
     request_timeout_seconds: float = 15.0
+    live_evidence_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("LIVE_EVIDENCE_ENABLED"),
+    )
+    live_evidence_timeout_seconds: float = Field(
+        default=12.0,
+        validation_alias=AliasChoices("LIVE_EVIDENCE_TIMEOUT_SECONDS"),
+    )
+    live_evidence_max_documents: int = Field(
+        default=10,
+        validation_alias=AliasChoices("LIVE_EVIDENCE_MAX_DOCUMENTS"),
+    )
+    live_evidence_max_google_results: int = Field(
+        default=6,
+        validation_alias=AliasChoices("LIVE_EVIDENCE_MAX_GOOGLE_RESULTS"),
+    )
+    live_evidence_max_listing_links_per_catalog: int = Field(
+        default=8,
+        validation_alias=AliasChoices("LIVE_EVIDENCE_MAX_LISTING_LINKS_PER_CATALOG"),
+    )
+    live_evidence_max_documents_per_catalog: int = Field(
+        default=2,
+        validation_alias=AliasChoices("LIVE_EVIDENCE_MAX_DOCUMENTS_PER_CATALOG"),
+    )
+    live_evidence_min_article_characters: int = Field(
+        default=240,
+        validation_alias=AliasChoices("LIVE_EVIDENCE_MIN_ARTICLE_CHARACTERS"),
+    )
 
     @field_validator("backend_cors_origins", mode="before")
     @classmethod
@@ -97,7 +166,13 @@ class Settings(BaseSettings):
             normalized = normalized.replace("postgresql+asyncpg://", "postgresql://", 1)
         return normalized
 
-    @field_validator("debug", "nvidia_enable_vision_fallback", mode="before")
+    @field_validator(
+        "debug",
+        "nvidia_enable_vision_fallback",
+        "google_fact_check_enabled",
+        "live_evidence_enabled",
+        mode="before",
+    )
     @classmethod
     def parse_bool_flags(cls, value: object) -> bool:
         if isinstance(value, bool):
@@ -115,6 +190,17 @@ class Settings(BaseSettings):
     @property
     def active_nvidia_reasoning_model(self) -> str | None:
         return self.nvidia_reasoning_model or self.nvidia_llm_model
+
+    @property
+    def active_nvidia_claim_extraction_model(self) -> str | None:
+        return self.nvidia_claim_extraction_model or self.active_nvidia_reasoning_model
+
+    @property
+    def active_nvidia_rerank_model(self) -> str | None:
+        if not self.nvidia_rerank_model:
+            return None
+        normalized = self.nvidia_rerank_model.strip()
+        return normalized or None
 
     @property
     def active_nvidia_vision_model(self) -> str | None:

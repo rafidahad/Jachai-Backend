@@ -4,6 +4,7 @@ from typing import Any
 from uuid import UUID
 
 import httpx
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,14 +14,19 @@ from app.core.config import settings
 from app.models.audit_log import AuditLog
 from app.models.claim import Claim, ClaimEvidenceLink
 from app.models.verification_job import VerificationJob
+from app.schemas.ai_schema import AIUsageSchema
 from app.schemas.claim_schema import ClaimResponseSchema, ClaimSubmissionResponseSchema, VerificationJobSchema
-from app.schemas.verdict_schema import EvidenceSnippetSchema
+from app.schemas.rerank_schema import EvidenceCandidateSchema
+from app.schemas.verdict_schema import EvidenceSnippetSchema, LLMVerdictSchema
 from app.services.ai_model_router import NVIDIAModelTask, get_model_for_task
 from app.services.cache_service import cache_service
 from app.services.cluster_service import get_or_create_cluster
 from app.services.embedding_service import embed_text
+from app.services.evidence_index_service import get_evidence_index_status
 from app.services.language_service import detect_language
+from app.services.live_evidence_service import hydrate_live_evidence
 from app.services.nvidia_llm_service import generate_verdict
+from app.services.nvidia_rerank_service import rerank_evidence
 from app.services.ocr_service import extract_text_from_image_with_fallback
 from app.services.pii_service import mask_pii
 from app.services.retrieval_service import retrieve_evidence
@@ -37,6 +43,157 @@ def _parse_uuid(value: UUID | str, *, code: str, message: str) -> UUID:
         return UUID(str(value))
     except ValueError as exc:
         raise AppError(status_code=422, code=code, message=message) from exc
+
+
+def _confidence_label_from_score(score: float) -> str:
+    if score >= 0.8:
+        return "High"
+    if score >= 0.5:
+        return "Medium"
+    return "Low"
+
+
+def _build_reasoning_text(
+    verdict: LLMVerdictSchema,
+    evidence: list[dict[str, Any]],
+    *,
+    rerank_applied: bool,
+) -> str:
+    relevant_count = sum(
+        1 for item in evidence if float(item.get("similarity_score", 0.0)) >= settings.min_relevant_similarity
+    )
+    return (
+        f"Evaluated {len(evidence)} evidence source(s), used {len(verdict.used_source_ids)} source(s) in the final "
+        f"answer, {relevant_count} met the similarity threshold of {settings.min_relevant_similarity:.2f}, "
+        f"and reranking was {'applied' if rerank_applied else 'not applied'}."
+    )
+
+
+def _build_evidence_candidates(retrieved: list[tuple[Any, float]]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for initial_rank, (source, similarity_score) in enumerate(retrieved, start=1):
+        candidate = EvidenceCandidateSchema(
+            source_id=source.id,
+            title=source.title,
+            url=source.url,
+            publisher=source.publisher,
+            language=source.language,
+            source_type=source.source_type,
+            snippet=source.snippet,
+            similarity_score=float(similarity_score),
+            initial_rank=initial_rank,
+        )
+        candidates.append(candidate.model_dump(mode="json"))
+    return candidates
+
+
+def _build_ai_usage_payload(
+    *,
+    reasoning_model: str | None,
+    rerank_model: str | None,
+    vision_model: str | None,
+    llm_call_count: int,
+    rerank_call_count: int,
+    vision_call_count: int,
+) -> dict[str, Any]:
+    return AIUsageSchema(
+        embedding_model=settings.embedding_model,
+        rerank_model=rerank_model,
+        reasoning_model=reasoning_model,
+        vision_model=vision_model,
+        llm_call_count=llm_call_count,
+        rerank_call_count=rerank_call_count,
+        vision_call_count=vision_call_count,
+    ).model_dump(mode="json")
+
+
+def _apply_verdict_guardrails(
+    verdict: LLMVerdictSchema,
+    *,
+    claim_text: str,
+    language: str,
+    evidence: list[dict[str, Any]],
+) -> LLMVerdictSchema:
+    valid_source_ids = {str(item["source_id"]) for item in evidence if item.get("source_id")}
+    filtered_source_ids = [source_id for source_id in verdict.used_source_ids if str(source_id) in valid_source_ids]
+    relevant_evidence = [
+        item for item in evidence if float(item.get("similarity_score", 0.0)) >= settings.min_relevant_similarity
+    ]
+
+    extracted_claim = verdict.extracted_claim or claim_text
+    detected_language = verdict.detected_language or language or "Unknown"
+    category = verdict.category or "Other"
+    explanation = verdict.explanation or (
+        "JachAI could not find enough reliable evidence from trusted sources to verify this claim."
+    )
+    user_response = verdict.user_response or explanation
+    verdict_label = verdict.verdict
+    confidence = min(max(float(verdict.confidence), 0.0), 1.0)
+    confidence_label = verdict.confidence_label
+
+    if not evidence:
+        verdict_label = "Not Enough Evidence"
+        confidence = min(confidence, 0.35)
+        confidence_label = "Low"
+        explanation = "JachAI could not find enough reliable evidence from trusted sources to verify this claim."
+        user_response = (
+            "JachAI Verdict: Not Enough Evidence. We could not find enough reliable sources to verify this claim yet."
+        )
+        filtered_source_ids = []
+    elif not relevant_evidence:
+        verdict_label = "Not Enough Evidence"
+        confidence = min(confidence, 0.45)
+        confidence_label = "Low"
+        explanation = "The retrieved evidence is too weak or only loosely related to this claim."
+        user_response = (
+            "JachAI Verdict: Not Enough Evidence. The available sources are not strong enough to verify this claim."
+        )
+        filtered_source_ids = []
+
+    if verdict_label in {"Likely True", "Likely False"} and not filtered_source_ids:
+        verdict_label = "Not Enough Evidence"
+        confidence = min(confidence, 0.35)
+        confidence_label = "Low"
+        explanation = "A strong true or false verdict needs at least one valid supporting source."
+        user_response = (
+            "JachAI Verdict: Not Enough Evidence. We need at least one trustworthy source before giving a strong "
+            "true or false verdict."
+        )
+
+    if not filtered_source_ids and confidence_label == "High":
+        confidence_label = "Low"
+        confidence = min(confidence, 0.45)
+
+    if not filtered_source_ids and verdict_label == "Misleading" and confidence > 0.65:
+        confidence = 0.65
+        confidence_label = "Medium"
+
+    if not confidence_label:
+        confidence_label = _confidence_label_from_score(confidence)
+
+    return verdict.model_copy(
+        update={
+            "extracted_claim": extracted_claim,
+            "detected_language": detected_language,
+            "category": category,
+            "verdict": verdict_label,
+            "confidence": confidence,
+            "confidence_label": confidence_label,
+            "explanation": explanation,
+            "user_response": user_response,
+            "used_source_ids": filtered_source_ids,
+        }
+    )
+
+
+def _parse_ai_usage(context_payload: dict[str, Any]) -> AIUsageSchema | None:
+    payload = context_payload.get("ai_usage")
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return AIUsageSchema.model_validate(payload, strict=False)
+    except ValidationError:
+        return None
 
 
 def serialize_job(job: VerificationJob) -> VerificationJobSchema:
@@ -56,6 +213,12 @@ def serialize_job(job: VerificationJob) -> VerificationJobSchema:
 
 
 def serialize_claim(claim: Claim) -> ClaimResponseSchema:
+    context_payload = claim.context_payload or {}
+    evidence_metadata = {
+        str(item["source_id"]): item
+        for item in context_payload.get("evidence", [])
+        if isinstance(item, dict) and item.get("source_id")
+    }
     evidence = [
         EvidenceSnippetSchema(
             source_id=link.source.id,
@@ -65,7 +228,10 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
             language=link.source.language,
             source_type=link.source.source_type,
             snippet=link.source.snippet,
-            similarity_score=link.similarity_score,
+            similarity_score=float(evidence_metadata.get(str(link.source.id), {}).get("similarity_score", link.similarity_score)),
+            rerank_score=evidence_metadata.get(str(link.source.id), {}).get("rerank_score"),
+            initial_rank=evidence_metadata.get(str(link.source.id), {}).get("initial_rank"),
+            final_rank=evidence_metadata.get(str(link.source.id), {}).get("final_rank", link.rank),
         )
         for link in sorted(claim.evidence_links, key=lambda item: item.rank)
         if link.source is not None
@@ -80,16 +246,22 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
         masked_text=claim.masked_text,
         normalized_hash=claim.normalized_hash,
         language=claim.language,
+        extracted_claim=str(context_payload.get("extracted_claim") or claim.cleaned_text),
+        detected_language=str(context_payload.get("detected_language") or claim.language),
+        category=str(context_payload.get("category") or "Other"),
         review_status=claim.review_status,
         verdict=claim.verdict,
         confidence=claim.confidence,
+        confidence_label=str(context_payload.get("confidence_label") or _confidence_label_from_score(claim.confidence)),
         explanation=claim.explanation,
+        user_response=str(context_payload.get("user_response") or claim.share_summary),
         reasoning=claim.reasoning,
         share_summary=claim.share_summary,
         created_at=claim.created_at,
         updated_at=claim.updated_at,
         evidence=evidence,
-        context_payload=claim.context_payload,
+        ai_usage=_parse_ai_usage(context_payload),
+        context_payload=context_payload,
     )
 
 
@@ -227,31 +399,85 @@ async def _pipeline_from_text(
             if existing:
                 return await _return_existing_claim(session, job, existing, cached_hit=True)
 
+        live_evidence = await hydrate_live_evidence(
+            session,
+            claim_text=masked_text,
+            language=language,
+            normalized_hash=hash_value,
+        )
+        claim_context["live_evidence"] = live_evidence
+
+        evidence_index = await get_evidence_index_status(session)
+        if not evidence_index.ready:
+            raise AppError(
+                status_code=503,
+                code="EVIDENCE_INDEX_NOT_READY",
+                message=(
+                    f"{evidence_index.message} Ingest real trusted sources through /api/v1/sources/ingest "
+                    "before verifying claims."
+                ),
+            )
+
+        if not await cache_service.reserve_uncached_claim_slot():
+            raise AppError(
+                status_code=429,
+                code="AI_RATE_LIMITED",
+                message="Verification is busy right now. Please try again shortly.",
+            )
+
         embedding = await embed_text(masked_text)
-        retrieved = await retrieve_evidence(session, embedding, top_k=settings.evidence_top_k)
-        evidence_payload = [
+        retrieved = await retrieve_evidence(session, embedding, top_k=settings.pgvector_top_k)
+        retrieved_candidates = _build_evidence_candidates(retrieved)
+        selected_evidence, rerank_metadata = await rerank_evidence(masked_text, retrieved_candidates)
+
+        verdict, llm_metadata = await generate_verdict(masked_text, language, selected_evidence)
+        verdict = _apply_verdict_guardrails(
+            verdict,
+            claim_text=cleaned_text,
+            language=language,
+            evidence=selected_evidence,
+        )
+
+        reasoning_model = llm_metadata.get("model") or get_model_for_task(NVIDIAModelTask.CLAIM_REASONING)
+        claim_extraction_model = get_model_for_task(NVIDIAModelTask.CLAIM_EXTRACTION)
+        rerank_model = rerank_metadata.get("model")
+        vision_model = str(claim_context.get("nvidia_vision_model")) if claim_context.get("nvidia_vision_model") else None
+        ai_usage = _build_ai_usage_payload(
+            reasoning_model=reasoning_model,
+            rerank_model=rerank_model,
+            vision_model=vision_model,
+            llm_call_count=int(llm_metadata.get("call_count", 0)),
+            rerank_call_count=int(rerank_metadata.get("call_count", 0)),
+            vision_call_count=1 if claim_context.get("ocr_method") == "nvidia_vision_fallback" else 0,
+        )
+        claim_context.update(
             {
-                "source_id": str(source.id),
-                "title": source.title,
-                "url": source.url,
-                "publisher": source.publisher,
-                "language": source.language,
-                "source_type": source.source_type,
-                "snippet": source.snippet,
-                "similarity_score": score,
+                "extracted_claim": verdict.extracted_claim,
+                "detected_language": verdict.detected_language,
+                "category": verdict.category,
+                "confidence_label": verdict.confidence_label,
+                "user_response": verdict.user_response,
+                "claim_extraction_model": claim_extraction_model,
+                "nvidia_reasoning_model": reasoning_model,
+                "retrieval": {
+                    "candidate_count": len(retrieved_candidates),
+                    "selected_count": len(selected_evidence),
+                    "pgvector_top_k": settings.pgvector_top_k,
+                    "final_evidence_top_k": settings.final_evidence_top_k,
+                    "min_relevant_similarity": settings.min_relevant_similarity,
+                },
+                "rerank": rerank_metadata,
+                "evidence": selected_evidence,
+                "ai_usage": ai_usage,
             }
-            for source, score in retrieved
-        ]
-        verdict = await generate_verdict(masked_text, language, evidence_payload)
-        reasoning_model = get_model_for_task(NVIDIAModelTask.CLAIM_REASONING)
-        if reasoning_model:
-            claim_context["nvidia_reasoning_model"] = reasoning_model
+        )
+
         cluster = await get_or_create_cluster(
             session,
             topic_hash=hash_value,
-            title=cleaned_text[:120],
-            language=language,
-            summary=verdict.summary,
+            title=verdict.extracted_claim[:120],
+            language=verdict.detected_language,
+            summary=verdict.user_response,
         )
 
         claim = Claim(
@@ -266,8 +492,12 @@ async def _pipeline_from_text(
             verdict=verdict.verdict,
             confidence=verdict.confidence,
             explanation=verdict.explanation,
-            reasoning=verdict.reasoning,
-            share_summary=verdict.summary,
+            reasoning=_build_reasoning_text(
+                verdict,
+                selected_evidence,
+                rerank_applied=bool(rerank_metadata.get("applied")),
+            ),
+            share_summary=verdict.user_response,
             review_status="pending",
             context_payload=claim_context,
         )
@@ -277,17 +507,17 @@ async def _pipeline_from_text(
         if cluster.representative_claim_id is None:
             cluster.representative_claim_id = claim.id
 
-        source_score_lookup = {str(source.id): score for source, score in retrieved}
-        source_lookup = {str(source.id): source for source, score in retrieved}
-        ordered_source_ids = [str(source_id) for source_id in verdict.source_ids if str(source_id) in source_lookup]
+        source_lookup = {str(item["source_id"]): item for item in selected_evidence}
+        ordered_source_ids = [str(source_id) for source_id in verdict.used_source_ids if str(source_id) in source_lookup]
         fallback_ids = [source_id for source_id in source_lookup.keys() if source_id not in ordered_source_ids]
-        for index, source_id in enumerate(ordered_source_ids + fallback_ids, start=1):
+        for position, source_id in enumerate(ordered_source_ids + fallback_ids, start=1):
+            source_item = source_lookup[source_id]
             session.add(
                 ClaimEvidenceLink(
                     claim_id=claim.id,
                     source_id=UUID(source_id),
-                    rank=index,
-                    similarity_score=float(source_score_lookup[source_id]),
+                    rank=int(source_item.get("final_rank") or position),
+                    similarity_score=float(source_item["similarity_score"]),
                 )
             )
 
@@ -297,7 +527,12 @@ async def _pipeline_from_text(
                 action="claim_verified",
                 entity_type="claim",
                 entity_id=str(claim.id),
-                details={"normalized_hash": hash_value, "language": language, "input_type": input_type},
+                details={
+                    "normalized_hash": hash_value,
+                    "language": language,
+                    "input_type": input_type,
+                    "ai_usage": ai_usage,
+                },
             )
         )
         try:
@@ -379,6 +614,14 @@ async def process_image_claim(
     content_type: str | None = None,
     external_id: str | None = None,
 ) -> ClaimSubmissionResponseSchema:
+    max_bytes = settings.max_image_size_mb * 1024 * 1024
+    if len(image_bytes) > max_bytes:
+        raise AppError(
+            status_code=422,
+            code="IMAGE_TOO_LARGE",
+            message=f"Image must be {settings.max_image_size_mb} MB or smaller.",
+        )
+
     text, ocr_method = await extract_text_from_image_with_fallback(image_bytes, mime_type=content_type)
     metadata: dict[str, Any] = {"ocr_method": ocr_method}
     if filename:

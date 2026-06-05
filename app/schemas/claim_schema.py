@@ -6,8 +6,9 @@ from uuid import UUID
 
 from pydantic import Field, HttpUrl, StrictBool, StrictInt, StrictStr
 
+from app.schemas.ai_schema import AIUsageSchema
 from app.schemas.common import StrictBaseModel
-from app.schemas.verdict_schema import EvidenceSnippetSchema, LanguageLabel, VerdictLabel
+from app.schemas.verdict_schema import ConfidenceLabel, EvidenceSnippetSchema, LanguageLabel, VerdictLabel
 
 InputType = Literal["text", "image", "url"]
 ReviewStatus = Literal["pending", "reviewed", "flagged"]
@@ -38,15 +39,21 @@ class ClaimResponseSchema(StrictBaseModel):
     masked_text: StrictStr
     normalized_hash: StrictStr
     language: LanguageLabel
+    extracted_claim: StrictStr
+    detected_language: StrictStr
+    category: StrictStr
     review_status: ReviewStatus
     verdict: VerdictLabel
     confidence: float
+    confidence_label: ConfidenceLabel
     explanation: StrictStr
+    user_response: StrictStr
     reasoning: StrictStr
     share_summary: StrictStr
     created_at: datetime
     updated_at: datetime
     evidence: list[EvidenceSnippetSchema] = Field(default_factory=list)
+    ai_usage: AIUsageSchema | None = None
     context_payload: dict[str, object] = Field(default_factory=dict)
 
 

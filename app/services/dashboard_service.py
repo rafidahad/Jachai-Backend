@@ -26,12 +26,27 @@ async def get_summary_metrics(session: AsyncSession) -> SummaryMetricSchema:
     ) or 0
     total_sources = await session.scalar(select(func.count()).select_from(EvidenceSource)) or 0
     total_clusters = await session.scalar(select(func.count()).select_from(RumorCluster)) or 0
+    average_confidence = await session.scalar(select(func.avg(Claim.confidence))) or 0
+    top_language_row = (
+        await session.execute(
+            select(Claim.language, func.count())
+            .group_by(Claim.language)
+            .order_by(func.count().desc(), Claim.language.asc())
+            .limit(1)
+        )
+    ).first()
+    ocr_submissions = await session.scalar(
+        select(func.count()).select_from(Claim).where(Claim.input_type == "image")
+    ) or 0
     return SummaryMetricSchema(
         total_claims=int(total_claims),
         claims_today=int(claims_today),
         reviewed_claims=int(reviewed_claims),
         total_sources=int(total_sources),
         total_clusters=int(total_clusters),
+        average_confidence=round(float(average_confidence) * 100, 1),
+        top_language=str(top_language_row[0]) if top_language_row else "Unknown",
+        ocr_submissions=int(ocr_submissions),
     )
 
 

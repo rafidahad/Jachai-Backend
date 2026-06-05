@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.rate_limit import claim_submission_rate_limit
 from app.core.security import verify_internal_api_key
 from app.db.session import get_db
@@ -28,6 +29,7 @@ from app.services.claim_pipeline import (
 from app.utils.errors import AppError
 
 router = APIRouter(prefix="/claims", tags=["claims"])
+ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
 
 @router.post("/text", response_model=ClaimSubmissionResponseSchema, dependencies=[Depends(claim_submission_rate_limit)])
@@ -44,9 +46,20 @@ async def submit_image_claim(
     external_id: Annotated[str | None, Form()] = None,
     session: AsyncSession = Depends(get_db),
 ) -> ClaimSubmissionResponseSchema:
-    if not image.content_type or not image.content_type.startswith("image/"):
-        raise AppError(status_code=422, code="INVALID_IMAGE", message="An image upload is required.")
+    if not image.content_type or image.content_type not in ALLOWED_IMAGE_TYPES:
+        raise AppError(
+            status_code=422,
+            code="INVALID_IMAGE",
+            message="Image must be PNG, JPG, JPEG, or WEBP.",
+        )
     image_bytes = await image.read()
+    max_bytes = settings.max_image_size_mb * 1024 * 1024
+    if len(image_bytes) > max_bytes:
+        raise AppError(
+            status_code=422,
+            code="IMAGE_TOO_LARGE",
+            message=f"Image must be {settings.max_image_size_mb} MB or smaller.",
+        )
     return await process_image_claim(
         session,
         image_bytes,

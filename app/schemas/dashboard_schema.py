@@ -15,6 +15,9 @@ class SummaryMetricSchema(StrictBaseModel):
     reviewed_claims: StrictInt
     total_sources: StrictInt
     total_clusters: StrictInt
+    average_confidence: float
+    top_language: StrictStr
+    ocr_submissions: StrictInt
 
 
 class DistributionItemSchema(StrictBaseModel):

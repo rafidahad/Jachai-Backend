@@ -8,12 +8,26 @@ from PIL import Image
 from pytesseract import TesseractError, TesseractNotFoundError
 
 from app.core.config import settings
-from app.services.nvidia_llm_service import extract_text_with_vision_fallback
+from app.services.nvidia_vision_service import extract_text_with_vision_fallback
 from app.services.text_cleaning_service import clean_text
 from app.utils.errors import AppError
 
 
+def _looks_like_usable_ocr(text: str) -> bool:
+    if len(text) < settings.ocr_min_characters:
+        return False
+    useful_characters = sum(1 for char in text if char.isalnum())
+    return useful_characters / max(len(text), 1) >= 0.35
+
+
 async def extract_text_from_image(image_bytes: bytes) -> str:
+    if settings.ocr_engine.strip().lower() != "tesseract":
+        raise AppError(
+            status_code=500,
+            code="OCR_ENGINE_NOT_SUPPORTED",
+            message="Only Tesseract OCR is configured for this backend.",
+        )
+
     def _run() -> str:
         image = Image.open(BytesIO(image_bytes))
         return pytesseract.image_to_string(image, lang=settings.ocr_languages)
@@ -26,7 +40,7 @@ async def extract_text_from_image(image_bytes: bytes) -> str:
             code="OCR_FAILED",
             message="Tesseract OCR could not extract text from the image.",
         ) from exc
-    if len(text) < settings.ocr_min_characters:
+    if not _looks_like_usable_ocr(text):
         raise AppError(
             status_code=422,
             code="OCR_FAILED",

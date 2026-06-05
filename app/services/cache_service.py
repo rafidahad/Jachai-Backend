@@ -56,5 +56,15 @@ class CacheService:
             return False
         return True
 
+    async def reserve_uncached_claim_slot(self) -> bool:
+        redis = await get_redis()
+        key = "claims:uncached:rpm"
+        count = await redis.incr(key)
+        if count == 1:
+            await redis.expire(key, 60)
+        if count > settings.nvidia_max_uncached_claims_per_minute:
+            return False
+        return True
+
 
 cache_service = CacheService()

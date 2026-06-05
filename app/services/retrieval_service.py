@@ -12,7 +12,7 @@ async def retrieve_evidence(
     embedding: list[float],
     top_k: int | None = None,
 ) -> list[tuple[EvidenceSource, float]]:
-    limit = top_k or settings.evidence_top_k
+    limit = top_k or settings.pgvector_top_k
     distance = EvidenceSource.embedding.cosine_distance(embedding)
     statement: Select = (
         select(EvidenceSource, distance.label("distance"))
