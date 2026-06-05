@@ -5,6 +5,7 @@ from sqlalchemy import text
 from app.core.logging import get_logger
 from app.db.base import Base
 from app.db.session import engine
+import app.models  # noqa: F401
 
 logger = get_logger(__name__)
 

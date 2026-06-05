@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
+from typing import Annotated
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -29,7 +31,10 @@ class Settings(BaseSettings):
     embedding_model: str = Field(default="BAAI/bge-m3", alias="EMBEDDING_MODEL")
     embedding_dim: int = Field(default=1024, alias="EMBEDDING_DIM")
     internal_api_key: str = Field(alias="INTERNAL_API_KEY")
-    backend_cors_origins: list[str] = Field(default_factory=list, alias="BACKEND_CORS_ORIGINS")
+    backend_cors_origins: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        alias="BACKEND_CORS_ORIGINS",
+    )
     log_level: str = "INFO"
     auto_create_tables: bool = True
     result_cache_ttl_seconds: int = 60 * 60 * 24
@@ -57,6 +62,51 @@ class Settings(BaseSettings):
                 return [str(item).strip() for item in parsed if str(item).strip()]
             return [item.strip() for item in value.split(",") if item.strip()]
         raise TypeError("Invalid BACKEND_CORS_ORIGINS value")
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def parse_database_url(cls, value: object) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise TypeError("Invalid DATABASE_URL value")
+        normalized = value.strip()
+        if normalized.startswith("postgres://"):
+            normalized = "postgresql://" + normalized[len("postgres://") :]
+        if normalized.startswith("postgresql://"):
+            normalized = normalized.replace("postgresql://", "postgresql+asyncpg://", 1)
+        parts = urlsplit(normalized)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        if "sslmode" in query and "ssl" not in query:
+            query["ssl"] = query.pop("sslmode")
+        query.pop("channel_binding", None)
+        normalized = urlunsplit(parts._replace(query=urlencode(query)))
+        return normalized
+
+    @field_validator("database_sync_url", mode="before")
+    @classmethod
+    def parse_database_sync_url(cls, value: object) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise TypeError("Invalid DATABASE_SYNC_URL value")
+        normalized = value.strip()
+        if normalized.startswith("postgres://"):
+            normalized = "postgresql://" + normalized[len("postgres://") :]
+        if normalized.startswith("postgresql+asyncpg://"):
+            normalized = normalized.replace("postgresql+asyncpg://", "postgresql://", 1)
+        return normalized
+
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug(cls, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None or value == "":
+            return False
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on", "debug", "development", "dev"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "release", "production", "prod"}:
+                return False
+        raise TypeError("Invalid DEBUG value")
 
 
 @lru_cache(maxsize=1)
