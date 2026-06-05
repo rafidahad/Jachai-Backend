@@ -27,7 +27,12 @@ class Settings(BaseSettings):
     redis_url: str = Field(alias="REDIS_URL")
     nvidia_api_key: str = Field(alias="NVIDIA_API_KEY")
     nvidia_base_url: str = Field(alias="NVIDIA_BASE_URL")
-    nvidia_llm_model: str = Field(alias="NVIDIA_LLM_MODEL")
+    nvidia_llm_model: str | None = Field(default=None, alias="NVIDIA_LLM_MODEL")
+    nvidia_reasoning_model: str | None = Field(default=None, alias="NVIDIA_REASONING_MODEL")
+    nvidia_vision_model: str | None = Field(default=None, alias="NVIDIA_VISION_MODEL")
+    nvidia_enable_vision_fallback: bool = Field(default=False, alias="NVIDIA_ENABLE_VISION_FALLBACK")
+    nvidia_rpm_safety_limit: int = Field(default=30, alias="NVIDIA_MAX_RPM")
+    nvidia_timeout_seconds: float = Field(default=60.0, alias="NVIDIA_TIMEOUT_SECONDS")
     embedding_model: str = Field(default="BAAI/bge-m3", alias="EMBEDDING_MODEL")
     embedding_dim: int = Field(default=1024, alias="EMBEDDING_DIM")
     internal_api_key: str = Field(alias="INTERNAL_API_KEY")
@@ -42,7 +47,6 @@ class Settings(BaseSettings):
     job_status_ttl_seconds: int = 60 * 60 * 24
     claim_rate_limit_per_minute: int = 20
     internal_rate_limit_per_minute: int = 60
-    nvidia_rpm_safety_limit: int = 30
     evidence_top_k: int = 5
     ocr_min_characters: int = 12
     ocr_languages: str = "eng+ben+hin"
@@ -93,9 +97,9 @@ class Settings(BaseSettings):
             normalized = normalized.replace("postgresql+asyncpg://", "postgresql://", 1)
         return normalized
 
-    @field_validator("debug", mode="before")
+    @field_validator("debug", "nvidia_enable_vision_fallback", mode="before")
     @classmethod
-    def parse_debug(cls, value: object) -> bool:
+    def parse_bool_flags(cls, value: object) -> bool:
         if isinstance(value, bool):
             return value
         if value is None or value == "":
@@ -106,7 +110,22 @@ class Settings(BaseSettings):
                 return True
             if normalized in {"0", "false", "no", "off", "release", "production", "prod"}:
                 return False
-        raise TypeError("Invalid DEBUG value")
+        raise TypeError("Invalid boolean flag value")
+
+    @property
+    def active_nvidia_reasoning_model(self) -> str | None:
+        return self.nvidia_reasoning_model or self.nvidia_llm_model
+
+    @property
+    def active_nvidia_vision_model(self) -> str | None:
+        if not self.nvidia_vision_model:
+            return None
+        normalized = self.nvidia_vision_model.strip()
+        return normalized or None
+
+    @property
+    def nvidia_vision_enabled(self) -> bool:
+        return self.nvidia_enable_vision_fallback and self.active_nvidia_vision_model is not None
 
 
 @lru_cache(maxsize=1)

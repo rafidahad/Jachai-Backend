@@ -47,7 +47,13 @@ async def submit_image_claim(
     if not image.content_type or not image.content_type.startswith("image/"):
         raise AppError(status_code=422, code="INVALID_IMAGE", message="An image upload is required.")
     image_bytes = await image.read()
-    return await process_image_claim(session, image_bytes, filename=image.filename, external_id=external_id)
+    return await process_image_claim(
+        session,
+        image_bytes,
+        filename=image.filename,
+        content_type=image.content_type,
+        external_id=external_id,
+    )
 
 
 @router.post("/url", response_model=ClaimSubmissionResponseSchema, dependencies=[Depends(claim_submission_rate_limit)])

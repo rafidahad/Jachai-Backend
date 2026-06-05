@@ -11,7 +11,11 @@ from app.schemas.health_schema import ComponentHealthSchema, HealthResponseSchem
 async def get_system_health() -> HealthResponseSchema:
     db_ok = await check_database_connection()
     redis_ok = await ping_redis()
-    nvidia_ok = bool(settings.nvidia_api_key and settings.nvidia_base_url and settings.nvidia_llm_model)
+    nvidia_ok = bool(
+        settings.nvidia_api_key
+        and settings.nvidia_base_url
+        and settings.active_nvidia_reasoning_model
+    )
     tesseract_ok = shutil.which("tesseract") is not None
 
     components = [
@@ -31,7 +35,11 @@ async def get_system_health() -> HealthResponseSchema:
             name="nvidia",
             status="healthy" if nvidia_ok else "degraded",
             ok=nvidia_ok,
-            message="NVIDIA API is configured." if nvidia_ok else "NVIDIA API is not configured.",
+            message=(
+                "NVIDIA reasoning model is configured."
+                if nvidia_ok
+                else "NVIDIA reasoning model is not configured."
+            ),
         ),
         ComponentHealthSchema(
             name="tesseract",

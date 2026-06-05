@@ -15,12 +15,13 @@ from app.models.claim import Claim, ClaimEvidenceLink
 from app.models.verification_job import VerificationJob
 from app.schemas.claim_schema import ClaimResponseSchema, ClaimSubmissionResponseSchema, VerificationJobSchema
 from app.schemas.verdict_schema import EvidenceSnippetSchema
+from app.services.ai_model_router import NVIDIAModelTask, get_model_for_task
 from app.services.cache_service import cache_service
 from app.services.cluster_service import get_or_create_cluster
 from app.services.embedding_service import embed_text
 from app.services.language_service import detect_language
 from app.services.nvidia_llm_service import generate_verdict
-from app.services.ocr_service import extract_text_from_image
+from app.services.ocr_service import extract_text_from_image_with_fallback
 from app.services.pii_service import mask_pii
 from app.services.retrieval_service import retrieve_evidence
 from app.services.text_cleaning_service import clean_text, text_from_html
@@ -193,6 +194,7 @@ async def _pipeline_from_text(
 ) -> ClaimSubmissionResponseSchema:
     job = await _create_job(session, input_type=input_type)
     try:
+        claim_context = dict(context_payload or {})
         cleaned_text = clean_text(raw_text)
         if len(cleaned_text) < 5:
             raise AppError(status_code=422, code="INPUT_TOO_SHORT", message="Claim text is too short.")
@@ -241,6 +243,9 @@ async def _pipeline_from_text(
             for source, score in retrieved
         ]
         verdict = await generate_verdict(masked_text, language, evidence_payload)
+        reasoning_model = get_model_for_task(NVIDIAModelTask.CLAIM_REASONING)
+        if reasoning_model:
+            claim_context["nvidia_reasoning_model"] = reasoning_model
         cluster = await get_or_create_cluster(
             session,
             topic_hash=hash_value,
@@ -264,7 +269,7 @@ async def _pipeline_from_text(
             reasoning=verdict.reasoning,
             share_summary=verdict.summary,
             review_status="pending",
-            context_payload=context_payload or {},
+            context_payload=claim_context,
         )
         session.add(claim)
         await session.flush()
@@ -371,14 +376,19 @@ async def process_image_claim(
     session: AsyncSession,
     image_bytes: bytes,
     filename: str | None = None,
+    content_type: str | None = None,
     external_id: str | None = None,
 ) -> ClaimSubmissionResponseSchema:
-    text = await extract_text_from_image(image_bytes)
-    metadata: dict[str, Any] = {}
+    text, ocr_method = await extract_text_from_image_with_fallback(image_bytes, mime_type=content_type)
+    metadata: dict[str, Any] = {"ocr_method": ocr_method}
     if filename:
         metadata["filename"] = filename
     if external_id:
         metadata["external_id"] = external_id
+    if ocr_method == "nvidia_vision_fallback":
+        vision_model = get_model_for_task(NVIDIAModelTask.IMAGE_OCR_FALLBACK)
+        if vision_model:
+            metadata["nvidia_vision_model"] = vision_model
     return await _pipeline_from_text(
         session,
         input_type="image",

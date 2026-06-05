@@ -38,3 +38,7 @@ class VerdictResponseSchema(StrictBaseModel):
     reasoning: StrictStr
     summary: StrictStr
     evidence: list[EvidenceSnippetSchema] = Field(default_factory=list)
+
+
+class VisionOCRSchema(StrictBaseModel):
+    extracted_text: StrictStr = Field(min_length=1)

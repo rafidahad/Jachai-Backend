@@ -5,8 +5,10 @@ from io import BytesIO
 
 import pytesseract
 from PIL import Image
+from pytesseract import TesseractError, TesseractNotFoundError
 
 from app.core.config import settings
+from app.services.nvidia_llm_service import extract_text_with_vision_fallback
 from app.services.text_cleaning_service import clean_text
 from app.utils.errors import AppError
 
@@ -16,7 +18,14 @@ async def extract_text_from_image(image_bytes: bytes) -> str:
         image = Image.open(BytesIO(image_bytes))
         return pytesseract.image_to_string(image, lang=settings.ocr_languages)
 
-    text = clean_text(await asyncio.to_thread(_run))
+    try:
+        text = clean_text(await asyncio.to_thread(_run))
+    except (OSError, TesseractError, TesseractNotFoundError) as exc:
+        raise AppError(
+            status_code=422,
+            code="OCR_FAILED",
+            message="Tesseract OCR could not extract text from the image.",
+        ) from exc
     if len(text) < settings.ocr_min_characters:
         raise AppError(
             status_code=422,
@@ -24,3 +33,19 @@ async def extract_text_from_image(image_bytes: bytes) -> str:
             message="OCR could not extract enough text from the image.",
         )
     return text
+
+
+async def extract_text_from_image_with_fallback(
+    image_bytes: bytes,
+    *,
+    mime_type: str | None = None,
+) -> tuple[str, str]:
+    try:
+        return await extract_text_from_image(image_bytes), "tesseract"
+    except AppError as exc:
+        if exc.code != "OCR_FAILED":
+            raise
+        vision_text = await extract_text_with_vision_fallback(image_bytes, mime_type=mime_type)
+        if vision_text:
+            return vision_text, "nvidia_vision_fallback"
+        raise

@@ -1,0 +1,17 @@
+{
+  "items": [
+    {
+      "title": "Government fact-check bulletin on viral internet shutdown claim",
+      "url": "https://example.com/fact-check/internet-shutdown",
+      "publisher": "JachAI Sample Source",
+      "language": "English",
+      "source_type": "fact_check",
+      "snippet": "A sample fact-check source used for Postman verification flow tests.",
+      "text_content": "This sample source says there is no official nationwide internet shutdown announcement for tonight. Users should rely on official telecom notices and government statements instead of forwarded rumors.",
+      "metadata": {
+        "seeded_by": "postman",
+        "category": "fact_check"
+      }
+    }
+  ]
+}

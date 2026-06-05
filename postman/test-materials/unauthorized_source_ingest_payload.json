@@ -1,0 +1,16 @@
+{
+  "items": [
+    {
+      "title": "Unauthorized ingest test",
+      "url": "https://example.com/unauthorized-source-test",
+      "publisher": "Postman",
+      "language": "English",
+      "source_type": "article",
+      "snippet": "This request intentionally omits the internal API key.",
+      "text_content": "This request intentionally omits the internal API key to verify that the backend rejects protected source-ingest calls.",
+      "metadata": {
+        "case": "unauthorized"
+      }
+    }
+  ]
+}

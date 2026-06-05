@@ -7,6 +7,16 @@
   },
   "variable": [
     {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8000",
+      "type": "string"
+    },
+    {
+      "key": "internal_api_key",
+      "value": "replace-with-your-internal-api-key",
+      "type": "string"
+    },
+    {
       "key": "claim_id",
       "value": "",
       "type": "string"
@@ -55,6 +65,16 @@
       "key": "sample_webhook_url",
       "value": "https://en.wikipedia.org/wiki/Misinformation",
       "type": "string"
+    },
+    {
+      "key": "test_materials_dir",
+      "value": "/run/media/bakau/WORKPLACE/JachAI/backend/postman/test-materials",
+      "type": "string"
+    },
+    {
+      "key": "sample_image_path",
+      "value": "/run/media/bakau/WORKPLACE/JachAI/backend/postman/test-materials/sample_claim_image.png",
+      "type": "string"
     }
   ],
   "item": [
@@ -79,9 +99,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/health"
-            },
+            "url": "{{base_url}}/health",
             "description": "Basic liveness check."
           }
         },
@@ -103,9 +121,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/health/system"
-            },
+            "url": "{{base_url}}/api/v1/health/system",
             "description": "Checks DB, Redis, NVIDIA config, and Tesseract availability."
           }
         }
@@ -151,10 +167,8 @@
                 }
               }
             },
-            "url": {
-              "raw": "{{base_url}}/api/v1/sources/ingest"
-            },
-            "description": "Protected endpoint. Seeds at least one evidence source so the claim pipeline has something to retrieve."
+            "url": "{{base_url}}/api/v1/sources/ingest",
+            "description": "Protected endpoint. Seeds at least one evidence source so the claim pipeline has something to retrieve. Matching material file: `postman/test-materials/source_ingest_payload.json`."
           }
         },
         {
@@ -176,9 +190,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/sources"
-            }
+            "url": "{{base_url}}/api/v1/sources"
           }
         },
         {
@@ -199,9 +211,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/sources/{{source_id}}"
-            },
+            "url": "{{base_url}}/api/v1/sources/{{source_id}}",
             "description": "Requires `source_id` from the source ingest or source list request."
           }
         }
@@ -245,9 +255,8 @@
                 }
               }
             },
-            "url": {
-              "raw": "{{base_url}}/api/v1/claims/text"
-            }
+            "url": "{{base_url}}/api/v1/claims/text",
+            "description": "Matching material file: `postman/test-materials/claim_text_payload.json`."
           }
         },
         {
@@ -275,8 +284,8 @@
                 {
                   "key": "image",
                   "type": "file",
-                  "src": "CHANGE_ME_WITH_LOCAL_IMAGE_PATH.png",
-                  "description": "Choose a real local image file in Postman Desktop before sending."
+                  "src": "/run/media/bakau/WORKPLACE/JachAI/backend/postman/test-materials/sample_claim_image.png",
+                  "description": "Bundled OCR sample image. If Postman does not auto-attach it after import, browse to `{{sample_image_path}}` manually."
                 },
                 {
                   "key": "external_id",
@@ -285,10 +294,8 @@
                 }
               ]
             },
-            "url": {
-              "raw": "{{base_url}}/api/v1/claims/image"
-            },
-            "description": "Requires a real image file selection in Postman. OCR depends on Tesseract being installed on the backend host."
+            "url": "{{base_url}}/api/v1/claims/image",
+            "description": "Uses the bundled OCR sample image at `postman/test-materials/sample_claim_image.png`. Reference OCR text: `postman/test-materials/sample_claim_image_expected_ocr.txt`. OCR depends on Tesseract being installed on the backend host."
           }
         },
         {
@@ -324,10 +331,8 @@
                 }
               }
             },
-            "url": {
-              "raw": "{{base_url}}/api/v1/claims/url"
-            },
-            "description": "Depends on outbound HTTP access from the backend and enough text on the target page."
+            "url": "{{base_url}}/api/v1/claims/url",
+            "description": "Matching material file: `postman/test-materials/claim_url_payload.json`. Depends on outbound HTTP access from the backend and enough text on the target page."
           }
         },
         {
@@ -348,9 +353,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/verification-jobs/{{job_id}}"
-            },
+            "url": "{{base_url}}/api/v1/verification-jobs/{{job_id}}",
             "description": "Requires `job_id` from one of the claim or webhook submissions."
           }
         },
@@ -373,9 +376,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/claims/{{claim_id}}"
-            },
+            "url": "{{base_url}}/api/v1/claims/{{claim_id}}",
             "description": "Requires `claim_id` from a successful claim or webhook submission."
           }
         },
@@ -397,9 +398,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/claims/{{claim_id}}/share-summary"
-            }
+            "url": "{{base_url}}/api/v1/claims/{{claim_id}}/share-summary"
           }
         },
         {
@@ -438,9 +437,8 @@
                 }
               }
             },
-            "url": {
-              "raw": "{{base_url}}/api/v1/claims/{{claim_id}}/review-status"
-            }
+            "url": "{{base_url}}/api/v1/claims/{{claim_id}}/review-status",
+            "description": "Matching material file: `postman/test-materials/review_status_payload.json`."
           }
         },
         {
@@ -462,9 +460,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/claims?limit=10&offset=0"
-            }
+            "url": "{{base_url}}/api/v1/claims?limit=10&offset=0"
           }
         }
       ]
@@ -490,9 +486,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/dashboard/summary"
-            }
+            "url": "{{base_url}}/api/v1/dashboard/summary"
           }
         },
         {
@@ -513,9 +507,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/dashboard/verdict-distribution"
-            }
+            "url": "{{base_url}}/api/v1/dashboard/verdict-distribution"
           }
         },
         {
@@ -536,9 +528,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/dashboard/language-distribution"
-            }
+            "url": "{{base_url}}/api/v1/dashboard/language-distribution"
           }
         },
         {
@@ -559,9 +549,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/dashboard/claims-over-time"
-            }
+            "url": "{{base_url}}/api/v1/dashboard/claims-over-time"
           }
         },
         {
@@ -583,9 +571,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/dashboard/recent-claims"
-            }
+            "url": "{{base_url}}/api/v1/dashboard/recent-claims"
           }
         }
       ]
@@ -612,9 +598,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/rumor-clusters"
-            }
+            "url": "{{base_url}}/api/v1/rumor-clusters"
           }
         },
         {
@@ -635,9 +619,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/rumor-clusters/{{cluster_id}}"
-            },
+            "url": "{{base_url}}/api/v1/rumor-clusters/{{cluster_id}}",
             "description": "Requires `cluster_id` from a successful claim or cluster list."
           }
         }
@@ -685,9 +667,8 @@
                 }
               }
             },
-            "url": {
-              "raw": "{{base_url}}/api/v1/webhooks/inbound-message"
-            }
+            "url": "{{base_url}}/api/v1/webhooks/inbound-message",
+            "description": "Matching material file: `postman/test-materials/webhook_text_payload.json`."
           }
         },
         {
@@ -727,10 +708,8 @@
                 }
               }
             },
-            "url": {
-              "raw": "{{base_url}}/api/v1/webhooks/inbound-message"
-            },
-            "description": "Depends on outbound HTTP access from the backend."
+            "url": "{{base_url}}/api/v1/webhooks/inbound-message",
+            "description": "Matching material file: `postman/test-materials/webhook_url_payload.json`. Depends on outbound HTTP access from the backend."
           }
         }
       ]
@@ -770,9 +749,8 @@
                 }
               }
             },
-            "url": {
-              "raw": "{{base_url}}/api/v1/sources/ingest"
-            }
+            "url": "{{base_url}}/api/v1/sources/ingest",
+            "description": "Matching material file: `postman/test-materials/unauthorized_source_ingest_payload.json`."
           }
         },
         {
@@ -807,9 +785,8 @@
                 }
               }
             },
-            "url": {
-              "raw": "{{base_url}}/api/v1/claims/text"
-            }
+            "url": "{{base_url}}/api/v1/claims/text",
+            "description": "Matching material file: `postman/test-materials/invalid_text_claim_payload.json`."
           }
         },
         {
@@ -830,9 +807,7 @@
           "request": {
             "method": "GET",
             "header": [],
-            "url": {
-              "raw": "{{base_url}}/api/v1/claims/11111111-1111-1111-1111-111111111111"
-            }
+            "url": "{{base_url}}/api/v1/claims/11111111-1111-1111-1111-111111111111"
           }
         },
         {
@@ -871,9 +846,8 @@
                 }
               }
             },
-            "url": {
-              "raw": "{{base_url}}/api/v1/webhooks/inbound-message"
-            }
+            "url": "{{base_url}}/api/v1/webhooks/inbound-message",
+            "description": "Matching material file: `postman/test-materials/invalid_webhook_payload.json`."
           }
         }
       ]
