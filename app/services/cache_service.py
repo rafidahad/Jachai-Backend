@@ -33,6 +33,19 @@ class CacheService:
             json.dumps(payload, default=str),
         )
 
+    async def get_ai_task_payload(self, task_name: str, cache_key: str) -> dict[str, Any] | None:
+        redis = await get_redis()
+        payload = await redis.get(f"ai:{task_name}:{cache_key}")
+        return json.loads(payload) if payload else None
+
+    async def set_ai_task_payload(self, task_name: str, cache_key: str, payload: dict[str, Any]) -> None:
+        redis = await get_redis()
+        await redis.setex(
+            f"ai:{task_name}:{cache_key}",
+            settings.result_cache_ttl_seconds,
+            json.dumps(payload, default=str),
+        )
+
     async def set_job_status(self, job_id: str, payload: dict[str, Any]) -> None:
         redis = await get_redis()
         await redis.setex(

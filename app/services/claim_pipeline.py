@@ -25,7 +25,7 @@ from app.services.embedding_service import embed_text
 from app.services.evidence_index_service import get_evidence_index_status
 from app.services.language_service import detect_language
 from app.services.live_evidence_service import hydrate_live_evidence
-from app.services.nvidia_llm_service import generate_verdict
+from app.services.nvidia_llm_service import extract_claim_context, generate_search_queries, generate_verdict
 from app.services.nvidia_rerank_service import rerank_evidence
 from app.services.ocr_service import extract_text_from_image_with_fallback
 from app.services.pii_service import mask_pii
@@ -89,6 +89,8 @@ def _build_evidence_candidates(retrieved: list[tuple[Any, float]]) -> list[dict[
 
 def _build_ai_usage_payload(
     *,
+    claim_extraction_model: str | None,
+    query_generation_model: str | None,
     reasoning_model: str | None,
     rerank_model: str | None,
     vision_model: str | None,
@@ -98,6 +100,8 @@ def _build_ai_usage_payload(
 ) -> dict[str, Any]:
     return AIUsageSchema(
         embedding_model=settings.embedding_model,
+        claim_extraction_model=claim_extraction_model,
+        query_generation_model=query_generation_model,
         rerank_model=rerank_model,
         reasoning_model=reasoning_model,
         vision_model=vision_model,
@@ -404,11 +408,31 @@ async def _pipeline_from_text(
             if existing:
                 return await _return_existing_claim(session, job, existing, cached_hit=True)
 
+        if not await cache_service.reserve_uncached_claim_slot():
+            raise AppError(
+                status_code=429,
+                code="AI_RATE_LIMITED",
+                message="Verification is busy right now. Please try again shortly.",
+            )
+
+        extraction, extraction_metadata = await extract_claim_context(
+            masked_text,
+            language,
+            cache_key=hash_value,
+        )
+        query_generation, query_metadata = await generate_search_queries(
+            extraction=extraction,
+            original_text=masked_text,
+            cache_key=hash_value,
+        )
+        retrieval_query = extraction.extracted_claim or masked_text
+
         live_evidence = await hydrate_live_evidence(
             session,
-            claim_text=masked_text,
-            language=language,
+            claim_text=retrieval_query,
+            language=extraction.detected_language or language,
             normalized_hash=hash_value,
+            search_queries=query_generation.search_queries,
         )
         claim_context["live_evidence"] = live_evidence
 
@@ -423,19 +447,12 @@ async def _pipeline_from_text(
                 ),
             )
 
-        if not await cache_service.reserve_uncached_claim_slot():
-            raise AppError(
-                status_code=429,
-                code="AI_RATE_LIMITED",
-                message="Verification is busy right now. Please try again shortly.",
-            )
-
-        embedding = await embed_text(masked_text)
+        embedding = await embed_text(retrieval_query)
         retrieved = await retrieve_evidence(session, embedding, top_k=settings.pgvector_top_k)
         retrieved_candidates = _build_evidence_candidates(retrieved)
-        selected_evidence, rerank_metadata = await rerank_evidence(masked_text, retrieved_candidates)
+        selected_evidence, rerank_metadata = await rerank_evidence(retrieval_query, retrieved_candidates)
 
-        verdict, llm_metadata = await generate_verdict(masked_text, language, selected_evidence)
+        verdict, llm_metadata = await generate_verdict(extraction, selected_evidence)
         verdict = _apply_verdict_guardrails(
             verdict,
             claim_text=cleaned_text,
@@ -444,14 +461,21 @@ async def _pipeline_from_text(
         )
 
         reasoning_model = llm_metadata.get("model") or get_model_for_task(NVIDIAModelTask.CLAIM_REASONING)
-        claim_extraction_model = get_model_for_task(NVIDIAModelTask.CLAIM_EXTRACTION)
+        claim_extraction_model = extraction_metadata.get("model") or get_model_for_task(NVIDIAModelTask.CLAIM_EXTRACTION)
+        query_generation_model = query_metadata.get("model") or get_model_for_task(NVIDIAModelTask.SEARCH_QUERY_GENERATION)
         rerank_model = rerank_metadata.get("model")
         vision_model = str(claim_context.get("nvidia_vision_model")) if claim_context.get("nvidia_vision_model") else None
         ai_usage = _build_ai_usage_payload(
+            claim_extraction_model=claim_extraction_model,
+            query_generation_model=query_generation_model,
             reasoning_model=reasoning_model,
             rerank_model=rerank_model,
             vision_model=vision_model,
-            llm_call_count=int(llm_metadata.get("call_count", 0)),
+            llm_call_count=(
+                int(extraction_metadata.get("call_count", 0))
+                + int(query_metadata.get("call_count", 0))
+                + int(llm_metadata.get("call_count", 0))
+            ),
             rerank_call_count=int(rerank_metadata.get("call_count", 0)),
             vision_call_count=1 if claim_context.get("ocr_method") == "nvidia_vision_fallback" else 0,
         )
@@ -463,7 +487,16 @@ async def _pipeline_from_text(
                 "confidence_label": verdict.confidence_label,
                 "user_response": verdict.user_response,
                 "claim_extraction_model": claim_extraction_model,
+                "query_generation_model": query_generation_model,
                 "nvidia_reasoning_model": reasoning_model,
+                "claim_extraction": {
+                    "query_used_for_retrieval": retrieval_query,
+                    "call_count": int(extraction_metadata.get("call_count", 0)),
+                },
+                "search_query_generation": {
+                    "queries": query_generation.search_queries,
+                    "call_count": int(query_metadata.get("call_count", 0)),
+                },
                 "retrieval": {
                     "candidate_count": len(retrieved_candidates),
                     "selected_count": len(selected_evidence),

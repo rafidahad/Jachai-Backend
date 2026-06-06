@@ -17,6 +17,7 @@ from app.core.logging import get_logger
 from app.schemas.source_schema import SourceIngestItemSchema
 from app.services.google_fact_check_service import GoogleFactCheckMatch, search_google_fact_checks
 from app.services.language_service import detect_language
+from app.services.search_service import SearchResult, search_general_web
 from app.services.source_service import ingest_sources
 from app.services.text_cleaning_service import clean_text
 from app.services.trusted_publisher_registry import (
@@ -128,6 +129,21 @@ def _catalogs_for_language(language: str) -> list[TrustedPublisherCatalog]:
 
         selected.append(catalog)
     return selected
+
+
+def _build_live_search_queries(claim_text: str, search_queries: list[str] | None) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for query in [claim_text, *(search_queries or [])]:
+        cleaned = clean_text(query)
+        if len(cleaned) < 5:
+            continue
+        normalized = cleaned.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(cleaned)
+    return ordered[:6]
 
 
 def _extract_meta_content(soup: BeautifulSoup, *keys: tuple[str, str]) -> str | None:
@@ -355,12 +371,40 @@ async def _documents_from_google_matches(
     return [document for document in documents if isinstance(document, LiveEvidenceDocument)]
 
 
+async def _documents_from_search_results(
+    client: httpx.AsyncClient,
+    *,
+    results: list[SearchResult],
+) -> list[LiveEvidenceDocument]:
+    documents = await asyncio.gather(
+        *[
+            _fetch_document(
+                client,
+                result.url,
+                catalog=get_catalog_for_url(result.url),
+                base_metadata={
+                    "seeded_by": "live_trusted_lookup",
+                    "source_channel": "general_search_api",
+                    "search_provider": result.provider,
+                    "search_title": result.title,
+                    "search_snippet": result.snippet,
+                },
+            )
+            for result in results
+            if is_trusted_url(result.url)
+        ],
+        return_exceptions=True,
+    )
+    return [document for document in documents if isinstance(document, LiveEvidenceDocument)]
+
+
 async def hydrate_live_evidence(
     session: AsyncSession,
     *,
     claim_text: str,
     language: str,
     normalized_hash: str,
+    search_queries: list[str] | None = None,
 ) -> dict[str, Any]:
     if not settings.live_evidence_enabled:
         return {
@@ -372,13 +416,60 @@ async def hydrate_live_evidence(
             "channels": [],
         }
 
+    query_texts = _build_live_search_queries(claim_text, search_queries)
+    if not query_texts:
+        return {
+            "enabled": True,
+            "attempted": False,
+            "ingested_count": 0,
+            "created_count": 0,
+            "updated_count": 0,
+            "channels": [],
+            "search_queries": [],
+            "google_match_count": 0,
+            "general_search_result_count": 0,
+            "normalized_hash": normalized_hash,
+            "documents": [],
+        }
+    channels = ["google_fact_check_api"]
+    if settings.general_search_enabled:
+        channels.append("general_search_api")
+    channels.append("trusted_catalog")
+
     timeout = min(settings.live_evidence_timeout_seconds, settings.request_timeout_seconds)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        google_matches = await search_google_fact_checks(claim_text, language=language)
+        google_match_results = await asyncio.gather(
+            *[search_google_fact_checks(query, language=language) for query in query_texts],
+            return_exceptions=True,
+        )
+        google_matches_by_url: dict[str, GoogleFactCheckMatch] = {}
+        for result in google_match_results:
+            if isinstance(result, Exception):
+                logger.warning("google_fact_check_query_failed error=%s", result)
+                continue
+            for match in result:
+                google_matches_by_url.setdefault(match.review_url, match)
+        google_matches = list(google_matches_by_url.values())
         google_documents = await _documents_from_google_matches(client, matches=google_matches)
+
+        general_search_results_by_url: dict[str, SearchResult] = {}
+        if settings.general_search_enabled:
+            general_search_results_nested = await asyncio.gather(
+                *[search_general_web(query, language=language) for query in query_texts],
+                return_exceptions=True,
+            )
+            for result in general_search_results_nested:
+                if isinstance(result, Exception):
+                    logger.warning("general_search_query_failed error=%s", result)
+                    continue
+                for item in result:
+                    general_search_results_by_url.setdefault(item.url, item)
+        general_search_results = list(general_search_results_by_url.values())
+        general_documents = await _documents_from_search_results(client, results=general_search_results)
+
         catalog_documents_nested = await asyncio.gather(
             *[
-                _discover_catalog_documents(client, catalog=catalog, query_text=claim_text)
+                _discover_catalog_documents(client, catalog=catalog, query_text=query_texts[0])
                 for catalog in _catalogs_for_language(language)
             ],
             return_exceptions=True,
@@ -392,7 +483,7 @@ async def hydrate_live_evidence(
         catalog_documents.extend(result)
 
     deduped_documents: dict[str, LiveEvidenceDocument] = {}
-    for document in [*google_documents, *catalog_documents]:
+    for document in [*google_documents, *general_documents, *catalog_documents]:
         deduped_documents.setdefault(document.url, document)
 
     selected_documents = list(deduped_documents.values())[: settings.live_evidence_max_documents]
@@ -403,8 +494,10 @@ async def hydrate_live_evidence(
             "ingested_count": 0,
             "created_count": 0,
             "updated_count": 0,
-            "channels": ["google_fact_check_api", "trusted_catalog"],
+            "channels": channels,
+            "search_queries": query_texts,
             "google_match_count": len(google_matches),
+            "general_search_result_count": len(general_search_results),
             "normalized_hash": normalized_hash,
             "documents": [],
         }
@@ -429,8 +522,10 @@ async def hydrate_live_evidence(
         "ingested_count": len(items),
         "created_count": created_count,
         "updated_count": updated_count,
-        "channels": ["google_fact_check_api", "trusted_catalog"],
+        "channels": channels,
+        "search_queries": query_texts,
         "google_match_count": len(google_matches),
+        "general_search_result_count": len(general_search_results),
         "normalized_hash": normalized_hash,
         "documents": [
             {

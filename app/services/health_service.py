@@ -18,6 +18,11 @@ async def get_system_health() -> HealthResponseSchema:
         and settings.nvidia_base_url
         and settings.active_nvidia_reasoning_model
     )
+    query_ok = bool(
+        settings.nvidia_api_key
+        and settings.nvidia_base_url
+        and settings.active_nvidia_query_model
+    )
     rerank_ok = bool(
         settings.nvidia_api_key
         and settings.nvidia_base_url
@@ -64,6 +69,16 @@ async def get_system_health() -> HealthResponseSchema:
             ),
         ),
         ComponentHealthSchema(
+            name="nvidia_query_generation",
+            status="healthy" if query_ok else "degraded",
+            ok=query_ok,
+            message=(
+                "NVIDIA query generation model is configured."
+                if query_ok
+                else "NVIDIA query generation model is not configured."
+            ),
+        ),
+        ComponentHealthSchema(
             name="nvidia_rerank",
             status="healthy" if rerank_ok else "degraded",
             ok=rerank_ok,
@@ -96,6 +111,22 @@ async def get_system_health() -> HealthResponseSchema:
             status="healthy" if evidence_index_ok else "degraded",
             ok=evidence_index_ok,
             message=evidence_index_message,
+        ),
+        ComponentHealthSchema(
+            name="general_search_api",
+            status=(
+                "healthy"
+                if (not settings.general_search_enabled or settings.general_search_api_key)
+                else "degraded"
+            ),
+            ok=(not settings.general_search_enabled or bool(settings.general_search_api_key)),
+            message=(
+                f"General search provider '{settings.normalized_search_provider}' is configured."
+                if settings.general_search_enabled and settings.general_search_api_key
+                else "General search API is disabled; using Google Fact Check API and trusted catalog only."
+                if not settings.general_search_enabled
+                else f"General search provider '{settings.normalized_search_provider}' needs GENERAL_SEARCH_API_KEY."
+            ),
         ),
     ]
 

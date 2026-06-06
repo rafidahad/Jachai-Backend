@@ -44,6 +44,10 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("NVIDIA_CLAIM_EXTRACTION_MODEL"),
     )
+    nvidia_query_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("NVIDIA_QUERY_MODEL", "NVIDIA_SEARCH_QUERY_MODEL"),
+    )
     nvidia_rerank_model: str | None = Field(
         default="nvidia/rerank-qa-mistral-4b",
         validation_alias=AliasChoices("NVIDIA_RERANK_MODEL"),
@@ -92,6 +96,16 @@ class Settings(BaseSettings):
     ocr_languages: str = Field(default="eng+ben+hin", validation_alias=AliasChoices("OCR_LANGUAGES"))
     max_image_size_mb: int = Field(default=8, validation_alias=AliasChoices("MAX_IMAGE_SIZE_MB"))
     request_timeout_seconds: float = 15.0
+    search_provider: str = Field(default="google_fact_check", validation_alias=AliasChoices("SEARCH_PROVIDER"))
+    general_search_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GENERAL_SEARCH_API_KEY"),
+    )
+    general_search_base_url: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("GENERAL_SEARCH_BASE_URL"),
+    )
+    general_search_max_results: int = Field(default=8, validation_alias=AliasChoices("GENERAL_SEARCH_MAX_RESULTS"))
     live_evidence_enabled: bool = Field(
         default=True,
         validation_alias=AliasChoices("LIVE_EVIDENCE_ENABLED"),
@@ -196,6 +210,10 @@ class Settings(BaseSettings):
         return self.nvidia_claim_extraction_model or self.active_nvidia_reasoning_model
 
     @property
+    def active_nvidia_query_model(self) -> str | None:
+        return self.nvidia_query_model or self.active_nvidia_claim_extraction_model
+
+    @property
     def active_nvidia_rerank_model(self) -> str | None:
         if not self.nvidia_rerank_model:
             return None
@@ -212,6 +230,14 @@ class Settings(BaseSettings):
     @property
     def nvidia_vision_enabled(self) -> bool:
         return self.nvidia_enable_vision_fallback and self.active_nvidia_vision_model is not None
+
+    @property
+    def normalized_search_provider(self) -> str:
+        return self.search_provider.strip().lower().replace("-", "_")
+
+    @property
+    def general_search_enabled(self) -> bool:
+        return self.normalized_search_provider not in {"", "none", "disabled", "google_fact_check"}
 
 
 @lru_cache(maxsize=1)

@@ -24,6 +24,25 @@ class LLMVerdictSchema(StrictBaseModel):
     used_source_ids: list[UUID] = Field(default_factory=list)
 
 
+class ClaimExtractionSchema(StrictBaseModel):
+    extracted_claim: StrictStr = Field(min_length=5)
+    detected_language: StrictStr = Field(min_length=2)
+    category: StrictStr = Field(min_length=2)
+
+
+class SearchQueryGenerationSchema(StrictBaseModel):
+    search_queries: list[StrictStr] = Field(min_length=1, max_length=6)
+
+
+class ReasoningVerdictSchema(StrictBaseModel):
+    verdict: VerdictLabel
+    confidence: StrictFloat = Field(ge=0.0, le=1.0)
+    confidence_label: ConfidenceLabel
+    explanation: StrictStr = Field(min_length=1)
+    user_response: StrictStr = Field(min_length=1)
+    used_source_ids: list[UUID] = Field(default_factory=list)
+
+
 class EvidenceSnippetSchema(StrictBaseModel):
     source_id: UUID
     title: StrictStr

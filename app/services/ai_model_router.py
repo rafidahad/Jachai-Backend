@@ -7,6 +7,7 @@ from app.core.config import settings
 
 class NVIDIAModelTask(str, Enum):
     CLAIM_EXTRACTION = "claim_extraction"
+    SEARCH_QUERY_GENERATION = "search_query_generation"
     CLAIM_REASONING = "claim_reasoning"
     EVIDENCE_RERANKING = "evidence_reranking"
     IMAGE_OCR_FALLBACK = "image_ocr_fallback"
@@ -15,6 +16,8 @@ class NVIDIAModelTask(str, Enum):
 def get_model_for_task(task: NVIDIAModelTask) -> str | None:
     if task == NVIDIAModelTask.CLAIM_EXTRACTION:
         return settings.active_nvidia_claim_extraction_model
+    if task == NVIDIAModelTask.SEARCH_QUERY_GENERATION:
+        return settings.active_nvidia_query_model
     if task == NVIDIAModelTask.CLAIM_REASONING:
         return settings.active_nvidia_reasoning_model
     if task == NVIDIAModelTask.EVIDENCE_RERANKING:
