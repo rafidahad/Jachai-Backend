@@ -308,13 +308,18 @@ async def _fail_job(
     code: str,
     message: str,
 ) -> None:
-    job.status = "failed"
-    job.error_code = code
-    job.error_message = message
-    job.completed_at = utc_now()
+    await session.rollback()
+    persisted_job = await session.get(VerificationJob, job.id)
+    if persisted_job is None:
+        return
+
+    persisted_job.status = "failed"
+    persisted_job.error_code = code
+    persisted_job.error_message = message
+    persisted_job.completed_at = utc_now()
     await session.commit()
-    await session.refresh(job)
-    await cache_service.set_job_status(str(job.id), serialize_job(job).model_dump(mode="json"))
+    await session.refresh(persisted_job)
+    await cache_service.set_job_status(str(persisted_job.id), serialize_job(persisted_job).model_dump(mode="json"))
 
 
 async def _fetch_url_text(url: str) -> tuple[str, dict[str, Any]]:

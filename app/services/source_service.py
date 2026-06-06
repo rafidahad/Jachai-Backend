@@ -70,14 +70,15 @@ async def ingest_sources(
             )
             session.add(source)
             created += 1
+            await session.flush()
 
         session.add(
             AuditLog(
                 actor="internal",
                 action="source_ingested",
                 entity_type="evidence_source",
-                entity_id=str(item.url),
-                details={"title": item.title, "language": language},
+                entity_id=str(source.id),
+                details={"title": item.title, "language": language, "url": str(item.url)},
             )
         )
 
