@@ -1,96 +1,411 @@
 from __future__ import annotations
-
-import math
-import re
+from time import perf_counter
 from typing import Any
 from uuid import UUID
-
-import httpx
-from pydantic import ValidationError
-from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from pydantic import HttpUrl
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
-from app.models.audit_log import AuditLog
-from app.models.claim import Claim, ClaimEvidenceLink
-from app.models.verification_job import VerificationJob
-from app.schemas.ai_schema import AIUsageSchema
-from app.schemas.claim_schema import ClaimResponseSchema, ClaimSubmissionResponseSchema, VerificationJobSchema
-from app.schemas.rerank_schema import EvidenceCandidateSchema
-from app.schemas.verdict_schema import EvidenceSnippetSchema, LLMVerdictSchema
-from app.services.ai_model_router import NVIDIAModelTask, get_model_for_task
+from app.core.logging import get_logger
 from app.services.cache_service import cache_service
-from app.services.cluster_service import get_or_create_cluster
-from app.services.embedding_service import embed_text
-from app.services.evidence_index_service import get_evidence_index_status
+from app.services.input_normalization_service import InputNormalizationService
+from app.services.claim_extraction_service import ClaimExtractionService
+from app.services.query_generation_service import QueryGenerationService
+from app.services.tavily_search_service import TavilySearchService
+from app.services.evidence_fetch_service import EvidenceFetchService
+from app.services.evidence_cleaning_service import EvidenceCleaningService
+from app.services.evidence_chunking_service import EvidenceChunkingService
+from app.services.evidence_ranking_service import EvidenceRankingService
+from app.services.source_credibility_service import SourceCredibilityService
+from app.services.evidence_classification_service import EvidenceClassificationService
+from app.services.verdict_service import VerdictService
 from app.services.language_service import detect_language
-from app.services.live_evidence_service import hydrate_live_evidence
-from app.services.nvidia_llm_service import extract_claim_context, generate_search_queries, generate_verdict
-from app.services.nvidia_rerank_service import rerank_evidence
-from app.services.ocr_service import extract_text_from_image_with_fallback
-from app.services.pii_service import mask_pii
-from app.services.retrieval_service import retrieve_evidence
-from app.services.text_cleaning_service import clean_text, text_from_html
-from app.utils.errors import AppError
+from app.services.source_service import ingest_sources
+from app.services.cluster_service import get_or_create_cluster
+from app.models.claim import Claim, ClaimEvidenceLink
+from app.schemas.source_schema import SourceIngestItemSchema
+from app.schemas.claim_schema import (
+    VerifyRequest,
+    VerifyResponse,
+    ClaimDetailsSchema,
+    EvidenceDetailsSchema,
+    SourceDetailsSchema,
+    SearchQueryDetailsSchema
+)
 from app.utils.hashing import normalized_hash
-from app.utils.time import utc_now
+from app.services.pii_service import mask_pii
+from app.utils.errors import AppError
 
-TOKEN_PATTERN = re.compile(r"[\w']+", re.UNICODE)
-MATCH_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "been",
-    "by",
-    "for",
-    "from",
-    "has",
-    "have",
-    "in",
-    "into",
-    "is",
-    "it",
-    "its",
-    "of",
-    "on",
-    "or",
-    "that",
-    "the",
-    "this",
-    "to",
-    "was",
-    "were",
-    "with",
-}
-MATCH_TOKEN_ALIASES = {
-    "buffaloes": "buffalo",
-    "cattle": "buffalo",
-    "cow": "buffalo",
-    "cows": "buffalo",
-    "mahish": "buffalo",
-    "mohis": "buffalo",
-    "mohish": "buffalo",
-    "mohishh": "buffalo",
-    "mosh": "buffalo",
-    "মহিষ": "buffalo",
-    "eidaladha": "sacrifice",
-    "eiduladha": "sacrifice",
-    "korban": "sacrifice",
-    "korbani": "sacrifice",
-    "kurban": "sacrifice",
-    "qorbani": "sacrifice",
-    "qurbani": "sacrifice",
-    "sacrificed": "sacrifice",
-    "sacrificing": "sacrifice",
-    "কোরবানি": "sacrifice",
-    "কুরবানি": "sacrifice",
-}
+logger = get_logger(__name__)
+
+class ClaimPipeline:
+    @staticmethod
+    async def verify_claim(session: AsyncSession, request: VerifyRequest) -> VerifyResponse:
+        warnings = []
+        debug_info = {}
+        pipeline_started = perf_counter()
+
+        # 1. Input Normalization
+        started = perf_counter()
+        cleaned_text, norm_warnings, norm_metadata = await InputNormalizationService.normalize(
+            request.input_type, request.content
+        )
+        warnings.extend(norm_warnings)
+        dur_normalization = perf_counter() - started
+        logger.info("claim_pipeline normalization_finished duration_ms=%s", round(dur_normalization * 1000, 2))
+
+        # Check Cache
+        masked_for_hash = mask_pii(cleaned_text)
+        content_hash = normalized_hash(masked_for_hash)
+        hash_value = normalized_hash(f"v2-{settings.verification_pipeline_version}:{content_hash}")
+        
+        # Check if cached result is available in Redis
+        cached_result = await cache_service.get_claim_result(f"v2:{hash_value}")
+        if cached_result:
+            logger.info("claim_pipeline cache_hit hash=%s", hash_value)
+            try:
+                # Return cached payload directly
+                res_obj = VerifyResponse.model_validate(cached_result)
+                if not res_obj.claim_id:
+                    db_claim_id = await session.scalar(
+                        select(Claim.id).where(Claim.normalized_hash == hash_value).limit(1)
+                    )
+                    if db_claim_id:
+                        res_obj.claim_id = str(db_claim_id)
+                return res_obj
+            except Exception as exc:
+                logger.warning("claim_pipeline invalid_cached_payload error=%s", str(exc))
+
+        # Check existing claim in DB
+        existing_claim_id = await session.scalar(
+            select(Claim.id).where(Claim.normalized_hash == hash_value).limit(1)
+        )
+        if existing_claim_id:
+            logger.info("claim_pipeline db_hit claim_id=%s", existing_claim_id)
+            existing_claim = await session.get(Claim, existing_claim_id)
+            if existing_claim and existing_claim.context_payload:
+                try:
+                    res_obj = VerifyResponse.model_validate(existing_claim.context_payload)
+                    res_obj.claim_id = str(existing_claim_id)
+                    return res_obj
+                except Exception as exc:
+                    logger.warning("claim_pipeline invalid_db_context_payload error=%s", str(exc))
+
+        # 2. Claim Extraction
+        started = perf_counter()
+        extraction = await ClaimExtractionService.extract_claim(cleaned_text)
+        dur_extraction = perf_counter() - started
+        logger.info("claim_pipeline extraction_finished duration_ms=%s", round(dur_extraction * 1000, 2))
+
+        # 3. Query Generation
+        started = perf_counter()
+        queries = await QueryGenerationService.generate_queries(extraction.normalized_claim, extraction.model_dump())
+        dur_queries = perf_counter() - started
+        logger.info("claim_pipeline query_gen_finished queries_count=%d duration_ms=%s", len(queries.queries), round(dur_queries * 1000, 2))
+
+        # 4. Search via Tavily
+        started = perf_counter()
+        search_results, search_warnings = await TavilySearchService.search(
+            queries.queries, max_results=request.options.max_search_results
+        )
+        warnings.extend(search_warnings)
+        dur_search = perf_counter() - started
+        logger.info("claim_pipeline search_finished results_count=%d duration_ms=%s", len(search_results), round(dur_search * 1000, 2))
+
+        # 5. Fetch Candidate URLs
+        started = perf_counter()
+        fetched_evidence, fetch_warnings = await EvidenceFetchService.fetch_all(
+            search_results, max_to_fetch=request.options.max_sources_to_fetch
+        )
+        warnings.extend(fetch_warnings)
+        dur_fetch = perf_counter() - started
+        logger.info("claim_pipeline fetching_finished duration_ms=%s", round(dur_fetch * 1000, 2))
+
+        # 6. Evidence Cleaning
+        started = perf_counter()
+        cleaned_evidence, clean_warnings = EvidenceCleaningService.clean(
+            fetched_evidence, requires_freshness=extraction.requires_freshness
+        )
+        warnings.extend(clean_warnings)
+        dur_cleaning = perf_counter() - started
+        logger.info("claim_pipeline cleaning_finished duration_ms=%s", round(dur_cleaning * 1000, 2))
+
+        # DB Ingestion of Sources
+        started = perf_counter()
+        ingest_items = []
+        for item in cleaned_evidence:
+            try:
+                pydantic_url = HttpUrl(item.url)
+            except Exception:
+                pydantic_url = item.url
+            
+            snippet = item.cleaned_text[:300]
+            if len(snippet) < 10:
+                snippet = (item.title or "Fallback Title") + " - snippet fallback context"
+            
+            body_text = item.cleaned_text
+            if len(body_text) < 20:
+                body_text = body_text + " - content fallback context metadata text"
+                
+            ingest_items.append(
+                SourceIngestItemSchema(
+                    title=item.title[:255] if item.title else "Untitled Source",
+                    url=pydantic_url,
+                    publisher=item.domain[:255],
+                    language=detect_language(body_text),
+                    source_type="tavily_search",
+                    snippet=snippet,
+                    text_content=body_text,
+                    metadata={"domain": item.domain, "snippet_only": item.snippet_only}
+                )
+            )
+        
+        url_to_uuid = {}
+        if ingest_items:
+            try:
+                db_sources, created, updated = await ingest_sources(session, ingest_items)
+                url_to_uuid = {str(src.url): str(src.id) for src in db_sources}
+            except Exception as exc:
+                logger.warning("claim_pipeline db_ingest_sources_failed error=%s", str(exc))
+                warnings.append("Failed to ingest evidence sources into DB. Proceeding with in-memory IDs.")
+        dur_ingest = perf_counter() - started
+        logger.info("claim_pipeline ingestion_finished duration_ms=%s", round(dur_ingest * 1000, 2))
+
+        # Update cleaned_evidence source_id with actual DB source UUIDs
+        for item in cleaned_evidence:
+            item.source_id = url_to_uuid.get(item.url, item.source_id)
+
+        # 7. Evidence Chunking
+        started = perf_counter()
+        chunks = EvidenceChunkingService.chunk(cleaned_evidence, max_chunks=request.options.max_evidence_chunks)
+        dur_chunking = perf_counter() - started
+        logger.info("claim_pipeline chunking_finished chunks_count=%d duration_ms=%s", len(chunks), round(dur_chunking * 1000, 2))
+
+        # 8. Evidence Ranking / Reranking
+        started = perf_counter()
+        ranked_chunks, rank_warnings = await EvidenceRankingService.rank(
+            extraction.normalized_claim, chunks, max_chunks=request.options.max_evidence_chunks
+        )
+        warnings.extend(rank_warnings)
+        dur_ranking = perf_counter() - started
+        logger.info("claim_pipeline ranking_finished duration_ms=%s", round(dur_ranking * 1000, 2))
+
+        # 9. Source Credibility Scoring
+        started = perf_counter()
+        # Find unique sources among ranked chunks
+        unique_sources = {}
+        for rc in ranked_chunks:
+            if rc.source_id not in unique_sources:
+                unique_sources[rc.source_id] = (rc.title, rc.url, rc.domain, rc.snippet_only)
+                
+        credibility_scores = []
+        for src_id, (title, url, domain, snippet_only) in unique_sources.items():
+            credibility_scores.append(
+                SourceCredibilityService.score_credibility(
+                    src_id, title, url, domain, snippet_only
+                )
+            )
+        dur_credibility = perf_counter() - started
+        logger.info("claim_pipeline credibility_finished duration_ms=%s", round(dur_credibility * 1000, 2))
+
+        # 10. Stance Classification
+        started = perf_counter()
+        classified_chunks = await EvidenceClassificationService.classify_chunks(
+            extraction.normalized_claim, ranked_chunks
+        )
+        dur_stance = perf_counter() - started
+        logger.info("claim_pipeline stance_classification_finished duration_ms=%s", round(dur_stance * 1000, 2))
+
+        # 11. Final Verdict
+        started = perf_counter()
+        verdict_res = await VerdictService.generate_verdict(
+            extraction.normalized_claim, extraction.model_dump(), classified_chunks, credibility_scores, warnings
+        )
+        dur_verdict = perf_counter() - started
+        logger.info("claim_pipeline verdict_finished verdict=%s duration_ms=%s", verdict_res.verdict, round(dur_verdict * 1000, 2))
+
+        # Compile final responses
+        claim_schema = ClaimDetailsSchema(
+            original_input=request.content,
+            normalized_claim=extraction.normalized_claim,
+            claim_type=extraction.claim_type,
+            entities=extraction.entities,
+            time_context=extraction.time_context,
+            location_context=extraction.location_context,
+            requires_freshness=extraction.requires_freshness
+        )
+
+        classified_lookup = {c.chunk_id: c for c in classified_chunks}
+        evidence_schema_list = []
+        for rc in ranked_chunks:
+            stance_info = classified_lookup.get(rc.chunk_id)
+            stance = stance_info.stance if stance_info else "neutral"
+            
+            score_info = next((cs for cs in credibility_scores if cs.source_id == rc.source_id), None)
+            cred_score = score_info.credibility_score if score_info else 0.50
+            
+            evidence_schema_list.append(
+                EvidenceDetailsSchema(
+                    evidence_id=rc.source_id,
+                    title=rc.title,
+                    url=rc.url,
+                    domain=rc.domain,
+                    published_date=rc.published_date,
+                    passage=rc.text,
+                    stance=stance,
+                    relevance_score=rc.relevance_score,
+                    credibility_score=cred_score,
+                    snippet_only=rc.snippet_only
+                )
+            )
+
+        sources_schema_list = [
+            SourceDetailsSchema(
+                source_id=cs.source_id,
+                title=cs.title,
+                url=cs.url,
+                domain=cs.domain,
+                source_type=cs.source_type,
+                credibility_score=cs.credibility_score,
+                credibility_reason=cs.credibility_reason
+            )
+            for cs in credibility_scores
+        ]
+
+        queries_schema_list = [
+            SearchQueryDetailsSchema(
+                query=q["query"],
+                purpose=q["purpose"]
+            )
+            for q in queries.queries
+        ]
+
+        pipeline_duration = perf_counter() - pipeline_started
+
+        if settings.enable_debug_output:
+            debug_info = {
+                "durations": {
+                    "input_normalization_ms": round(dur_normalization * 1000, 2),
+                    "claim_extraction_ms": round(dur_extraction * 1000, 2),
+                    "query_generation_ms": round(dur_queries * 1000, 2),
+                    "tavily_search_ms": round(dur_search * 1000, 2),
+                    "fetching_ms": round(dur_fetch * 1000, 2),
+                    "cleaning_ms": round(dur_cleaning * 1000, 2),
+                    "ingestion_ms": round(dur_ingest * 1000, 2),
+                    "chunking_ms": round(dur_chunking * 1000, 2),
+                    "ranking_ms": round(dur_ranking * 1000, 2),
+                    "credibility_ms": round(dur_credibility * 1000, 2),
+                    "stance_ms": round(dur_stance * 1000, 2),
+                    "verdict_ms": round(dur_verdict * 1000, 2),
+                    "total_pipeline_ms": round(pipeline_duration * 1000, 2)
+                },
+                "raw_extraction": extraction.model_dump(),
+                "all_warnings": warnings
+            }
+
+        response = VerifyResponse(
+            verdict=verdict_res.verdict,
+            confidence=verdict_res.confidence,
+            claim=claim_schema,
+            explanation=verdict_res.explanation,
+            evidence=evidence_schema_list,
+            sources=sources_schema_list,
+            search_queries=queries_schema_list,
+            warnings=warnings,
+            debug=debug_info if settings.enable_debug_output else None
+        )
+
+        # Save Claim record to Database
+        try:
+            cluster = await get_or_create_cluster(
+                session,
+                topic_hash=hash_value,
+                title=extraction.normalized_claim[:120],
+                language=detect_language(cleaned_text),
+                summary=verdict_res.explanation
+            )
+
+            if existing_claim_id:
+                claim_db = await session.get(Claim, existing_claim_id)
+                if claim_db:
+                    claim_db.verdict = verdict_res.verdict
+                    claim_db.confidence = verdict_res.confidence
+                    claim_db.explanation = verdict_res.explanation
+                    claim_db.reasoning = verdict_res.explanation
+                    claim_db.share_summary = verdict_res.explanation
+                    
+                    # Delete existing links to avoid duplicates
+                    from sqlalchemy import delete
+                    await session.execute(
+                        delete(ClaimEvidenceLink).where(ClaimEvidenceLink.claim_id == claim_db.id)
+                    )
+            else:
+                claim_db = Claim(
+                    cluster_id=cluster.id,
+                    input_type=request.input_type,
+                    source_url=norm_metadata.get("url") if request.input_type == "url" else None,
+                    raw_text=request.content,
+                    cleaned_text=cleaned_text,
+                    masked_text=mask_pii(cleaned_text),
+                    normalized_hash=hash_value,
+                    language=detect_language(cleaned_text),
+                    verdict=verdict_res.verdict,
+                    confidence=verdict_res.confidence,
+                    explanation=verdict_res.explanation,
+                    reasoning=verdict_res.explanation,
+                    share_summary=verdict_res.explanation,
+                    review_status="pending",
+                    context_payload={}
+                )
+                session.add(claim_db)
+            
+            await session.flush()
+
+            # Set response claim_id and update context_payload
+            response.claim_id = str(claim_db.id)
+            claim_db.context_payload = response.model_dump(mode="json")
+
+            # Create ClaimEvidenceLink entries
+            for pos, ev in enumerate(evidence_schema_list, start=1):
+                # Only link if the ID is a valid DB UUID
+                try:
+                    uuid_id = UUID(ev.evidence_id)
+                    session.add(
+                        ClaimEvidenceLink(
+                            claim_id=claim_db.id,
+                            source_id=uuid_id,
+                            rank=pos,
+                            similarity_score=ev.relevance_score
+                        )
+                    )
+                except ValueError:
+                    # Not a UUID (temporary ID used as fallback)
+                    continue
+            await session.commit()
+        except Exception as exc:
+            logger.warning("claim_pipeline failed_to_persist_to_db error=%s", str(exc))
+            await session.rollback()
+
+        # Cache Result in Redis
+        try:
+            await cache_service.set_claim_result(f"v2:{hash_value}", response.model_dump(mode="json"))
+            await cache_service.set_duplicate_claim_id(hash_value, hash_value) # register duplicate hash
+        except Exception as exc:
+            logger.warning("claim_pipeline failed_to_cache_redis error=%s", str(exc))
+
+        return response
+
+
+def _parse_ai_usage(context_payload: dict[str, Any]) -> Any | None:
+    payload = context_payload.get("ai_usage")
+    if not isinstance(payload, dict):
+        return None
+    try:
+        from app.schemas.ai_schema import AIUsageSchema
+        return AIUsageSchema.model_validate(payload, strict=False)
+    except Exception:
+        return None
 
 
 def _parse_uuid(value: UUID | str, *, code: str, message: str) -> UUID:
@@ -110,342 +425,18 @@ def _confidence_label_from_score(score: float) -> str:
     return "Low"
 
 
-def _canonical_match_token(token: str) -> str:
-    normalized = token.lower().strip("'")
-    if normalized.endswith("'s"):
-        normalized = normalized[:-2]
-    normalized = normalized.replace("-", "")
-    return MATCH_TOKEN_ALIASES.get(normalized, normalized)
-
-
-def _tokens_for_match(text: str) -> set[str]:
-    tokens: set[str] = set()
-    for token in TOKEN_PATTERN.findall(text):
-        canonical = _canonical_match_token(token)
-        if len(canonical) < 3 or canonical in MATCH_STOPWORDS:
-            continue
-        tokens.add(canonical)
-    return tokens
-
-
-def _token_overlap_score(claim_text: str, evidence_text: str) -> float:
-    claim_tokens = _tokens_for_match(claim_text)
-    if not claim_tokens:
-        return 0.0
-    evidence_tokens = _tokens_for_match(evidence_text)
-    if not evidence_tokens:
-        return 0.0
-    overlap = claim_tokens & evidence_tokens
-    return min(1.0, len(overlap) / len(claim_tokens))
-
-
-def _normalized_search_score(value: Any) -> float:
-    try:
-        score = float(value)
-    except (TypeError, ValueError):
-        return 0.0
-    if score <= 0:
-        return 0.0
-    if score <= 1:
-        return min(1.0, math.sqrt(score))
-    return min(1.0, score / 100.0)
-
-
-def _calculate_match_score(
-    *,
-    claim_text: str,
-    title: str,
-    snippet: str,
-    text_content: str,
-    similarity_score: float,
-    search_score: Any,
-) -> tuple[float, float]:
-    compact_content = text_content[:4000]
-    body_overlap = _token_overlap_score(claim_text, f"{title} {snippet} {compact_content}")
-    title_overlap = _token_overlap_score(claim_text, title)
-    lexical_score = max(body_overlap, title_overlap * 0.9)
-    retrieval_score = max(0.0, min(1.0, float(similarity_score)))
-    normalized_search = _normalized_search_score(search_score)
-    match_score = max(retrieval_score, lexical_score, normalized_search * 0.7)
-    return round(min(1.0, match_score), 4), round(lexical_score, 4)
-
-
-def _evidence_relevance_score(item: dict[str, Any]) -> float:
-    scores: list[float] = []
-    for key in ("match_score", "similarity_score", "lexical_overlap_score"):
-        try:
-            scores.append(float(item.get(key) or 0.0))
-        except (TypeError, ValueError):
-            continue
-    return max(scores) if scores else 0.0
-
-
-def _is_relevant_evidence(item: dict[str, Any]) -> bool:
-    return _evidence_relevance_score(item) >= settings.min_relevant_similarity
-
-
-def _looks_like_unsupported_detail(explanation: str, user_response: str) -> bool:
-    text = f"{explanation} {user_response}".lower()
-    markers = (
-        "does not mention",
-        "doesn't mention",
-        "do not mention",
-        "no mention",
-        "not mention",
-        "does not support",
-        "do not support",
-        "unsupported",
-        "but not",
-    )
-    return any(marker in text for marker in markers)
-
-
-def _source_ids_from_evidence(evidence: list[dict[str, Any]], *, limit: int = 3) -> list[UUID]:
-    source_ids: list[UUID] = []
-    for item in evidence:
-        try:
-            source_ids.append(UUID(str(item["source_id"])))
-        except (KeyError, TypeError, ValueError):
-            continue
-        if len(source_ids) >= limit:
-            break
-    return source_ids
-
-
-def _filter_selected_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    relevant = [item for item in evidence if _is_relevant_evidence(item)]
-    if not relevant:
-        return evidence
-
-    filtered: list[dict[str, Any]] = []
-    for final_rank, item in enumerate(relevant[: settings.final_evidence_top_k], start=1):
-        ranked_item = dict(item)
-        ranked_item["final_rank"] = final_rank
-        filtered.append(ranked_item)
-    return filtered
-
-
-def _build_reasoning_text(
-    verdict: LLMVerdictSchema,
-    evidence: list[dict[str, Any]],
-    *,
-    rerank_applied: bool,
-) -> str:
-    relevant_count = sum(1 for item in evidence if _is_relevant_evidence(item))
-    return (
-        f"Evaluated {len(evidence)} evidence source(s), used {len(verdict.used_source_ids)} source(s) in the final "
-        f"answer, {relevant_count} met the relevance threshold of {settings.min_relevant_similarity:.2f}, "
-        f"and reranking was {'applied' if rerank_applied else 'not applied'}."
-    )
-
-
-def _build_evidence_candidates(retrieved: list[tuple[Any, float]], *, claim_text: str) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    for initial_rank, (source, similarity_score) in enumerate(retrieved, start=1):
-        metadata = source.source_meta or {}
-        match_score, lexical_overlap_score = _calculate_match_score(
-            claim_text=claim_text,
-            title=source.title,
-            snippet=source.snippet,
-            text_content=source.text_content,
-            similarity_score=float(similarity_score),
-            search_score=metadata.get("search_score"),
-        )
-        candidate = EvidenceCandidateSchema(
-            source_id=source.id,
-            title=source.title,
-            url=source.url,
-            publisher=source.publisher,
-            language=source.language,
-            source_type=source.source_type,
-            snippet=source.snippet,
-            similarity_score=float(similarity_score),
-            match_score=match_score,
-            initial_rank=initial_rank,
-        )
-        candidate_payload = candidate.model_dump(mode="json")
-        candidate_payload.update(
-            {
-                "lexical_overlap_score": lexical_overlap_score,
-                "search_score": metadata.get("search_score"),
-                "trust_score": metadata.get("trust_score"),
-                "provider": metadata.get("provider"),
-            }
-        )
-        candidates.append(candidate_payload)
-    return candidates
-
-
-def _build_ai_usage_payload(
-    *,
-    claim_extraction_model: str | None,
-    query_generation_model: str | None,
-    reasoning_model: str | None,
-    rerank_model: str | None,
-    vision_model: str | None,
-    search_provider: str | None,
-    llm_call_count: int,
-    rerank_call_count: int,
-    vision_call_count: int,
-    tavily_request_count: int,
-) -> dict[str, Any]:
-    return AIUsageSchema(
-        embedding_model=settings.embedding_model,
-        claim_extraction_model=claim_extraction_model,
-        query_generation_model=query_generation_model,
-        rerank_model=rerank_model,
-        reasoning_model=reasoning_model,
-        vision_model=vision_model,
-        search_provider=search_provider,
-        llm_call_count=llm_call_count,
-        rerank_call_count=rerank_call_count,
-        vision_call_count=vision_call_count,
-        tavily_request_count=tavily_request_count,
-    ).model_dump(mode="json")
-
-
-def _apply_verdict_guardrails(
-    verdict: LLMVerdictSchema,
-    *,
-    claim_text: str,
-    language: str,
-    evidence: list[dict[str, Any]],
-) -> LLMVerdictSchema:
-    valid_source_ids = {str(item["source_id"]) for item in evidence if item.get("source_id")}
-    filtered_source_ids = [source_id for source_id in verdict.used_source_ids if str(source_id) in valid_source_ids]
-    relevant_evidence = [item for item in evidence if _is_relevant_evidence(item)]
-    trusted_evidence = [item for item in relevant_evidence if float(item.get("trust_score") or 0.50) > 0.50]
-
-    extracted_claim = verdict.extracted_claim or claim_text
-    detected_language = verdict.detected_language or language or "Unknown"
-    category = verdict.category or "Other"
-    explanation = verdict.explanation or (
-        "JachAI could not find enough reliable evidence from trusted sources to verify this claim."
-    )
-    user_response = verdict.user_response or explanation
-    verdict_label = verdict.verdict
-    confidence = min(max(float(verdict.confidence), 0.0), 1.0)
-    confidence_label = verdict.confidence_label
-
-    if not evidence:
-        verdict_label = "Not Enough Evidence"
-        confidence = min(confidence, 0.35)
-        confidence_label = "Low"
-        explanation = "JachAI could not find enough reliable evidence from trusted sources to verify this claim."
-        user_response = (
-            "JachAI Verdict: Not Enough Evidence. We could not find enough reliable sources to verify this claim yet."
-        )
-        filtered_source_ids = []
-    elif not relevant_evidence:
-        verdict_label = "Not Enough Evidence"
-        confidence = min(confidence, 0.45)
-        confidence_label = "Low"
-        explanation = "The retrieved evidence is too weak or only loosely related to this claim."
-        user_response = (
-            "JachAI Verdict: Not Enough Evidence. The available sources are not strong enough to verify this claim."
-        )
-        filtered_source_ids = []
-
-    if (
-        verdict_label == "Not Enough Evidence"
-        and trusted_evidence
-        and _looks_like_unsupported_detail(explanation, user_response)
-    ):
-        verdict_label = "Misleading"
-        confidence = max(min(confidence, 0.65), 0.55)
-        confidence_label = "Medium"
-        explanation = (
-            "Trusted sources confirm a related real story, but they do not support the claim's decisive added detail."
-        )
-        user_response = (
-            "JachAI Verdict: Misleading. Trusted sources match the same broad story, but the evidence does not "
-            "support the added detail in the claim."
-        )
-        if not filtered_source_ids:
-            filtered_source_ids = _source_ids_from_evidence(trusted_evidence)
-
-    if verdict_label in {"Likely True", "Likely False"} and not filtered_source_ids:
-        verdict_label = "Not Enough Evidence"
-        confidence = min(confidence, 0.35)
-        confidence_label = "Low"
-        explanation = "A strong true or false verdict needs at least one valid supporting source."
-        user_response = (
-            "JachAI Verdict: Not Enough Evidence. We need at least one trustworthy source before giving a strong "
-            "true or false verdict."
-        )
-
-    if not filtered_source_ids and confidence_label == "High":
-        confidence_label = "Low"
-        confidence = min(confidence, 0.45)
-
-    if not filtered_source_ids and verdict_label == "Misleading" and confidence > 0.65:
-        confidence = 0.65
-        confidence_label = "Medium"
-
-    if verdict_label in {"Likely True", "Likely False", "Misleading"} and not trusted_evidence:
-        confidence = min(confidence, 0.65)
-        confidence_label = "Medium" if confidence >= 0.5 else "Low"
-        if verdict_label in {"Likely True", "Likely False"}:
-            verdict_label = "Not Enough Evidence"
-            confidence = min(confidence, 0.45)
-            confidence_label = "Low"
-            explanation = "A strong verdict needs support from at least one trusted domain."
-            user_response = (
-                "JachAI Verdict: Not Enough Evidence. The available sources are not trusted enough for a strong "
-                "true or false verdict."
-            )
-
-    if not confidence_label:
-        confidence_label = _confidence_label_from_score(confidence)
-
-    return verdict.model_copy(
-        update={
-            "extracted_claim": extracted_claim,
-            "detected_language": detected_language,
-            "category": category,
-            "verdict": verdict_label,
-            "confidence": confidence,
-            "confidence_label": confidence_label,
-            "explanation": explanation,
-            "user_response": user_response,
-            "used_source_ids": filtered_source_ids,
-        }
-    )
-
-
-def _parse_ai_usage(context_payload: dict[str, Any]) -> AIUsageSchema | None:
-    payload = context_payload.get("ai_usage")
-    if not isinstance(payload, dict):
-        return None
-    try:
-        return AIUsageSchema.model_validate(payload, strict=False)
-    except ValidationError:
-        return None
-
-
-def serialize_job(job: VerificationJob) -> VerificationJobSchema:
-    return VerificationJobSchema(
-        id=job.id,
-        claim_id=job.claim_id,
-        input_type=job.input_type,
-        status=job.status,
-        normalized_hash=job.normalized_hash,
-        cached_hit=bool(job.cached_hit),
-        error_code=job.error_code,
-        error_message=job.error_message,
-        created_at=job.created_at,
-        updated_at=job.updated_at,
-        completed_at=job.completed_at,
-    )
-
-
 def serialize_claim(claim: Claim) -> ClaimResponseSchema:
+    from app.schemas.claim_schema import ClaimResponseSchema
+    from app.schemas.verdict_schema import EvidenceSnippetSchema
+
     context_payload = claim.context_payload or {}
-    evidence_metadata = {
-        str(item["source_id"]): item
-        for item in context_payload.get("evidence", [])
-        if isinstance(item, dict) and item.get("source_id")
-    }
+    evidence_metadata = {}
+    for item in context_payload.get("evidence", []):
+        if isinstance(item, dict):
+            sid = item.get("source_id") or item.get("evidence_id")
+            if sid:
+                evidence_metadata[str(sid)] = item
+
     evidence = [
         EvidenceSnippetSchema(
             source_id=link.source.id,
@@ -455,11 +446,15 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
             language=link.source.language,
             source_type=link.source.source_type,
             snippet=link.source.snippet,
-            similarity_score=float(evidence_metadata.get(str(link.source.id), {}).get("similarity_score", link.similarity_score)),
+            similarity_score=float(
+                evidence_metadata.get(str(link.source.id), {}).get("similarity_score")
+                or evidence_metadata.get(str(link.source.id), {}).get("relevance_score")
+                or link.similarity_score
+            ),
             match_score=evidence_metadata.get(str(link.source.id), {}).get("match_score"),
             rerank_score=evidence_metadata.get(str(link.source.id), {}).get("rerank_score"),
             search_score=evidence_metadata.get(str(link.source.id), {}).get("search_score"),
-            trust_score=evidence_metadata.get(str(link.source.id), {}).get("trust_score"),
+            trust_score=evidence_metadata.get(str(link.source.id), {}).get("trust_score") or evidence_metadata.get(str(link.source.id), {}).get("credibility_score"),
             provider=evidence_metadata.get(str(link.source.id), {}).get("provider"),
             initial_rank=evidence_metadata.get(str(link.source.id), {}).get("initial_rank"),
             final_rank=evidence_metadata.get(str(link.source.id), {}).get("final_rank", link.rank),
@@ -467,6 +462,7 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
         for link in sorted(claim.evidence_links, key=lambda item: item.rank)
         if link.source is not None
     ]
+    v2_claim = context_payload.get("claim") or {}
     return ClaimResponseSchema(
         id=claim.id,
         cluster_id=claim.cluster_id,
@@ -477,15 +473,27 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
         masked_text=claim.masked_text,
         normalized_hash=claim.normalized_hash,
         language=claim.language,
-        extracted_claim=str(context_payload.get("extracted_claim") or claim.cleaned_text),
+        extracted_claim=str(
+            context_payload.get("extracted_claim")
+            or v2_claim.get("normalized_claim")
+            or claim.cleaned_text
+        ),
         detected_language=str(context_payload.get("detected_language") or claim.language),
-        category=str(context_payload.get("category") or "Other"),
+        category=str(
+            context_payload.get("category")
+            or v2_claim.get("claim_type")
+            or "Other"
+        ),
         review_status=claim.review_status,
         verdict=claim.verdict,
         confidence=claim.confidence,
         confidence_label=str(context_payload.get("confidence_label") or _confidence_label_from_score(claim.confidence)),
         explanation=claim.explanation,
-        user_response=str(context_payload.get("user_response") or claim.share_summary),
+        user_response=str(
+            context_payload.get("user_response")
+            or context_payload.get("explanation")
+            or claim.share_summary
+        ),
         reasoning=claim.reasoning,
         share_summary=claim.share_summary,
         created_at=claim.created_at,
@@ -497,425 +505,13 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
 
 
 async def _load_claim(session: AsyncSession, claim_id: UUID | str) -> Claim | None:
-    parsed_id = _parse_uuid(claim_id, code="INVALID_CLAIM_ID", message="Claim ID must be a valid UUID.")
+    from sqlalchemy.orm import selectinload
     statement = (
         select(Claim)
         .options(selectinload(Claim.evidence_links).selectinload(ClaimEvidenceLink.source))
-        .where(Claim.id == parsed_id)
+        .where(Claim.id == _parse_uuid(claim_id, code="INVALID_CLAIM_ID", message="Claim ID must be a valid UUID."))
     )
     return await session.scalar(statement)
-
-
-async def _create_job(session: AsyncSession, input_type: str) -> VerificationJob:
-    job = VerificationJob(input_type=input_type, status="processing", cached_hit=False)
-    session.add(job)
-    await session.commit()
-    await session.refresh(job)
-    await cache_service.set_job_status(str(job.id), serialize_job(job).model_dump(mode="json"))
-    return job
-
-
-async def _complete_job(
-    session: AsyncSession,
-    job: VerificationJob,
-    *,
-    claim_id: UUID | None,
-    cached_hit: bool,
-    status: str = "completed",
-) -> None:
-    job.claim_id = claim_id
-    job.cached_hit = cached_hit
-    job.status = status
-    job.completed_at = utc_now()
-    await session.commit()
-    await session.refresh(job)
-    await cache_service.set_job_status(str(job.id), serialize_job(job).model_dump(mode="json"))
-
-
-async def _fail_job(
-    session: AsyncSession,
-    job: VerificationJob,
-    *,
-    code: str,
-    message: str,
-) -> None:
-    await session.rollback()
-    persisted_job = await session.get(VerificationJob, job.id)
-    if persisted_job is None:
-        return
-
-    persisted_job.status = "failed"
-    persisted_job.error_code = code
-    persisted_job.error_message = message
-    persisted_job.completed_at = utc_now()
-    await session.commit()
-    await session.refresh(persisted_job)
-    await cache_service.set_job_status(str(persisted_job.id), serialize_job(persisted_job).model_dump(mode="json"))
-
-
-async def _fetch_url_text(url: str) -> tuple[str, dict[str, Any]]:
-    try:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=settings.request_timeout_seconds,
-            headers={"User-Agent": "JachAI/0.1"},
-        ) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise AppError(status_code=422, code="URL_FETCH_FAILED", message=f"Could not fetch URL: {exc}") from exc
-
-    text = text_from_html(response.text)
-    if len(text) < 20:
-        raise AppError(
-            status_code=422,
-            code="URL_CONTENT_TOO_SHORT",
-            message="The URL did not contain enough text to verify.",
-        )
-    return text, {"fetched_url": str(response.url), "status_code": response.status_code}
-
-
-async def _return_existing_claim(
-    session: AsyncSession,
-    job: VerificationJob,
-    claim: Claim,
-    *,
-    cached_hit: bool,
-) -> ClaimSubmissionResponseSchema:
-    await _complete_job(session, job, claim_id=claim.id, cached_hit=cached_hit)
-    serialized = serialize_claim(claim)
-    await cache_service.set_duplicate_claim_id(claim.normalized_hash, str(claim.id))
-    await cache_service.set_claim_result(
-        claim.normalized_hash,
-        {"claim_id": str(claim.id), "job_id": str(job.id), "cached": cached_hit},
-    )
-    return ClaimSubmissionResponseSchema(job=serialize_job(job), claim=serialized, cached=cached_hit)
-
-
-async def _pipeline_from_text(
-    session: AsyncSession,
-    *,
-    input_type: str,
-    raw_text: str,
-    source_url: str | None = None,
-    context_payload: dict[str, Any] | None = None,
-) -> ClaimSubmissionResponseSchema:
-    job = await _create_job(session, input_type=input_type)
-    try:
-        claim_context = dict(context_payload or {})
-        cleaned_text = clean_text(raw_text)
-        if len(cleaned_text) < 5:
-            raise AppError(status_code=422, code="INPUT_TOO_SHORT", message="Claim text is too short.")
-        masked_text = mask_pii(cleaned_text)
-        language = detect_language(masked_text)
-        content_hash = normalized_hash(masked_text)
-        hash_value = normalized_hash(f"{settings.verification_pipeline_version}:{content_hash}")
-        claim_context.update(
-            {
-                "content_hash": content_hash,
-                "verification_pipeline_version": settings.verification_pipeline_version,
-            }
-        )
-
-        job.normalized_hash = hash_value
-        await session.commit()
-        await session.refresh(job)
-        await cache_service.set_job_status(str(job.id), serialize_job(job).model_dump(mode="json"))
-
-        duplicate_claim_id = await cache_service.get_duplicate_claim_id(hash_value)
-        if duplicate_claim_id:
-            existing = await _load_claim(session, duplicate_claim_id)
-            if existing:
-                return await _return_existing_claim(session, job, existing, cached_hit=True)
-
-        cached_payload = await cache_service.get_claim_result(hash_value)
-        if cached_payload and cached_payload.get("claim_id"):
-            existing = await _load_claim(session, cached_payload["claim_id"])
-            if existing:
-                return await _return_existing_claim(session, job, existing, cached_hit=True)
-
-        existing_db_claim = await session.scalar(
-            select(Claim.id).where(Claim.normalized_hash == hash_value).limit(1)
-        )
-        if existing_db_claim:
-            existing = await _load_claim(session, existing_db_claim)
-            if existing:
-                return await _return_existing_claim(session, job, existing, cached_hit=True)
-
-        if not await cache_service.reserve_uncached_claim_slot():
-            raise AppError(
-                status_code=429,
-                code="AI_RATE_LIMITED",
-                message="Verification is busy right now. Please try again shortly.",
-            )
-
-        extraction, extraction_metadata = await extract_claim_context(
-            masked_text,
-            language,
-            cache_key=hash_value,
-        )
-        query_generation, query_metadata = await generate_search_queries(
-            extraction=extraction,
-            original_text=masked_text,
-            cache_key=hash_value,
-        )
-        retrieval_query = extraction.extracted_claim or masked_text
-
-        live_evidence = await hydrate_live_evidence(
-            session,
-            claim_text=retrieval_query,
-            language=extraction.detected_language or language,
-            normalized_hash=hash_value,
-            search_queries=query_generation.search_queries,
-        )
-        claim_context["live_evidence"] = live_evidence
-
-        evidence_index = await get_evidence_index_status(session)
-        claim_context["evidence_index"] = {
-            "ready": evidence_index.ready,
-            "total_sources": evidence_index.total_sources,
-            "real_sources": evidence_index.real_sources,
-            "sample_sources": evidence_index.sample_sources,
-            "message": evidence_index.message,
-        }
-
-        embedding = await embed_text(retrieval_query)
-        retrieved = await retrieve_evidence(session, embedding, top_k=settings.pgvector_top_k)
-        retrieved_candidates = _build_evidence_candidates(retrieved, claim_text=retrieval_query)
-        selected_evidence, rerank_metadata = await rerank_evidence(retrieval_query, retrieved_candidates)
-        selected_evidence = _filter_selected_evidence(selected_evidence)
-
-        verdict, llm_metadata = await generate_verdict(extraction, selected_evidence)
-        verdict = _apply_verdict_guardrails(
-            verdict,
-            claim_text=cleaned_text,
-            language=language,
-            evidence=selected_evidence,
-        )
-
-        reasoning_model = llm_metadata.get("model") or get_model_for_task(NVIDIAModelTask.CLAIM_REASONING)
-        claim_extraction_model = extraction_metadata.get("model") or get_model_for_task(NVIDIAModelTask.CLAIM_EXTRACTION)
-        query_generation_model = query_metadata.get("model") or get_model_for_task(NVIDIAModelTask.SEARCH_QUERY_GENERATION)
-        rerank_model = rerank_metadata.get("model")
-        vision_model = str(claim_context.get("nvidia_vision_model")) if claim_context.get("nvidia_vision_model") else None
-        ai_usage = _build_ai_usage_payload(
-            claim_extraction_model=claim_extraction_model,
-            query_generation_model=query_generation_model,
-            reasoning_model=reasoning_model,
-            rerank_model=rerank_model,
-            vision_model=vision_model,
-            search_provider="tavily",
-            llm_call_count=(
-                int(extraction_metadata.get("call_count", 0))
-                + int(query_metadata.get("call_count", 0))
-                + int(llm_metadata.get("call_count", 0))
-            ),
-            rerank_call_count=int(rerank_metadata.get("call_count", 0)),
-            vision_call_count=1 if claim_context.get("ocr_method") == "nvidia_vision_fallback" else 0,
-            tavily_request_count=int(live_evidence.get("tavily_request_count", 0)),
-        )
-        claim_context.update(
-            {
-                "extracted_claim": verdict.extracted_claim,
-                "detected_language": verdict.detected_language,
-                "category": verdict.category,
-                "confidence_label": verdict.confidence_label,
-                "user_response": verdict.user_response,
-                "factual_summary": verdict.user_response,
-                "claim_extraction_model": claim_extraction_model,
-                "query_generation_model": query_generation_model,
-                "nvidia_reasoning_model": reasoning_model,
-                "claim_extraction": {
-                    "query_used_for_retrieval": retrieval_query,
-                    "call_count": int(extraction_metadata.get("call_count", 0)),
-                },
-                "search_query_generation": {
-                    "queries": query_generation.search_queries,
-                    "call_count": int(query_metadata.get("call_count", 0)),
-                },
-                "search_answer_context": live_evidence.get("search_answer_context"),
-                "search_provider": "tavily",
-                "retrieval": {
-                    "candidate_count": len(retrieved_candidates),
-                    "selected_count": len(selected_evidence),
-                    "pgvector_top_k": settings.pgvector_top_k,
-                    "final_evidence_top_k": settings.final_evidence_top_k,
-                    "min_relevant_similarity": settings.min_relevant_similarity,
-                },
-                "rerank": rerank_metadata,
-                "evidence": selected_evidence,
-                "ai_usage": ai_usage,
-            }
-        )
-
-        cluster = await get_or_create_cluster(
-            session,
-            topic_hash=hash_value,
-            title=verdict.extracted_claim[:120],
-            language=verdict.detected_language,
-            summary=verdict.user_response,
-        )
-
-        claim = Claim(
-            cluster_id=cluster.id,
-            input_type=input_type,
-            source_url=source_url,
-            raw_text=raw_text,
-            cleaned_text=cleaned_text,
-            masked_text=masked_text,
-            normalized_hash=hash_value,
-            language=language,
-            verdict=verdict.verdict,
-            confidence=verdict.confidence,
-            explanation=verdict.explanation,
-            reasoning=_build_reasoning_text(
-                verdict,
-                selected_evidence,
-                rerank_applied=bool(rerank_metadata.get("applied")),
-            ),
-            share_summary=verdict.user_response,
-            review_status="pending",
-            context_payload=claim_context,
-        )
-        session.add(claim)
-        await session.flush()
-
-        if cluster.representative_claim_id is None:
-            cluster.representative_claim_id = claim.id
-
-        source_lookup = {str(item["source_id"]): item for item in selected_evidence}
-        ordered_source_ids = [str(source_id) for source_id in verdict.used_source_ids if str(source_id) in source_lookup]
-        fallback_ids = [source_id for source_id in source_lookup.keys() if source_id not in ordered_source_ids]
-        for position, source_id in enumerate(ordered_source_ids + fallback_ids, start=1):
-            source_item = source_lookup[source_id]
-            session.add(
-                ClaimEvidenceLink(
-                    claim_id=claim.id,
-                    source_id=UUID(source_id),
-                    rank=int(source_item.get("final_rank") or position),
-                    similarity_score=float(source_item["similarity_score"]),
-                )
-            )
-
-        session.add(
-            AuditLog(
-                actor="pipeline",
-                action="claim_verified",
-                entity_type="claim",
-                entity_id=str(claim.id),
-                details={
-                    "normalized_hash": hash_value,
-                    "content_hash": content_hash,
-                    "verification_pipeline_version": settings.verification_pipeline_version,
-                    "language": language,
-                    "input_type": input_type,
-                    "ai_usage": ai_usage,
-                },
-            )
-        )
-        try:
-            await session.commit()
-        except IntegrityError:
-            await session.rollback()
-            existing_claim_id = await session.scalar(
-                select(Claim.id).where(Claim.normalized_hash == hash_value).limit(1)
-            )
-            if existing_claim_id:
-                existing = await _load_claim(session, existing_claim_id)
-                if existing:
-                    return await _return_existing_claim(session, job, existing, cached_hit=True)
-            raise
-
-        persisted_claim = await _load_claim(session, claim.id)
-        if persisted_claim is None:
-            raise AppError(status_code=500, code="CLAIM_SAVE_FAILED", message="Claim could not be reloaded.")
-
-        await _complete_job(session, job, claim_id=persisted_claim.id, cached_hit=False)
-        await cache_service.set_duplicate_claim_id(hash_value, str(persisted_claim.id))
-        await cache_service.set_claim_result(
-            hash_value,
-            {"claim_id": str(persisted_claim.id), "job_id": str(job.id), "cached": False},
-        )
-        return ClaimSubmissionResponseSchema(
-            job=serialize_job(job),
-            claim=serialize_claim(persisted_claim),
-            cached=False,
-        )
-    except AppError as exc:
-        await _fail_job(session, job, code=exc.code, message=exc.message)
-        raise
-    except Exception:
-        await _fail_job(
-            session,
-            job,
-            code="PIPELINE_FAILED",
-            message="Claim verification pipeline failed unexpectedly.",
-        )
-        raise
-
-
-async def process_text_claim(
-    session: AsyncSession,
-    text: str,
-    external_id: str | None = None,
-) -> ClaimSubmissionResponseSchema:
-    context = {"external_id": external_id} if external_id else {}
-    return await _pipeline_from_text(
-        session,
-        input_type="text",
-        raw_text=text,
-        context_payload=context,
-    )
-
-
-async def process_url_claim(
-    session: AsyncSession,
-    url: str,
-    external_id: str | None = None,
-) -> ClaimSubmissionResponseSchema:
-    text, metadata = await _fetch_url_text(url)
-    if external_id:
-        metadata["external_id"] = external_id
-    return await _pipeline_from_text(
-        session,
-        input_type="url",
-        raw_text=text,
-        source_url=url,
-        context_payload=metadata,
-    )
-
-
-async def process_image_claim(
-    session: AsyncSession,
-    image_bytes: bytes,
-    filename: str | None = None,
-    content_type: str | None = None,
-    external_id: str | None = None,
-) -> ClaimSubmissionResponseSchema:
-    max_bytes = settings.max_image_size_mb * 1024 * 1024
-    if len(image_bytes) > max_bytes:
-        raise AppError(
-            status_code=422,
-            code="IMAGE_TOO_LARGE",
-            message=f"Image must be {settings.max_image_size_mb} MB or smaller.",
-        )
-
-    text, ocr_method = await extract_text_from_image_with_fallback(image_bytes, mime_type=content_type)
-    metadata: dict[str, Any] = {"ocr_method": ocr_method}
-    if filename:
-        metadata["filename"] = filename
-    if external_id:
-        metadata["external_id"] = external_id
-    if ocr_method == "nvidia_vision_fallback":
-        vision_model = get_model_for_task(NVIDIAModelTask.IMAGE_OCR_FALLBACK)
-        if vision_model:
-            metadata["nvidia_vision_model"] = vision_model
-    return await _pipeline_from_text(
-        session,
-        input_type="image",
-        raw_text=text,
-        context_payload=metadata,
-    )
 
 
 async def get_claim_by_id(session: AsyncSession, claim_id: UUID | str) -> ClaimResponseSchema | None:
@@ -932,6 +528,9 @@ async def list_claims(
     limit: int = 20,
     offset: int = 0,
 ) -> tuple[list[ClaimResponseSchema], int]:
+    from sqlalchemy import func
+    from sqlalchemy.orm import selectinload
+
     filters = []
     if verdict:
         filters.append(Claim.verdict == verdict)
@@ -964,6 +563,7 @@ async def update_review_status(
     review_status: str,
     reviewer: str,
 ) -> ClaimResponseSchema | None:
+    from app.models.audit_log import AuditLog
     parsed_id = _parse_uuid(claim_id, code="INVALID_CLAIM_ID", message="Claim ID must be a valid UUID.")
     claim = await session.get(Claim, parsed_id)
     if claim is None:
@@ -978,18 +578,4 @@ async def update_review_status(
             details={"review_status": review_status},
         )
     )
-    await session.commit()
-    reloaded = await _load_claim(session, claim.id)
-    return serialize_claim(reloaded) if reloaded else None
-
-
-async def get_verification_job(
-    session: AsyncSession,
-    job_id: UUID | str,
-) -> VerificationJobSchema | None:
-    parsed_id = _parse_uuid(job_id, code="INVALID_JOB_ID", message="Job ID must be a valid UUID.")
-    job = await session.get(VerificationJob, parsed_id)
-    if job is not None:
-        return serialize_job(job)
-    cached = await cache_service.get_job_status(str(job_id))
-    return VerificationJobSchema.model_validate(cached, strict=False) if cached else None
+    return serialize_claim(claim)

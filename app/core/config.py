@@ -96,6 +96,16 @@ class Settings(BaseSettings):
     ocr_languages: str = Field(default="eng+ben+hin", validation_alias=AliasChoices("OCR_LANGUAGES"))
     max_image_size_mb: int = Field(default=8, validation_alias=AliasChoices("MAX_IMAGE_SIZE_MB"))
     request_timeout_seconds: float = 15.0
+    enable_debug_output: bool = Field(default=False, validation_alias=AliasChoices("ENABLE_DEBUG_OUTPUT"))
+    trusted_domains: str = Field(
+        default="nasa.gov,who.int,cdc.gov,un.org,reuters.com,apnews.com,bbc.com",
+        validation_alias=AliasChoices("TRUSTED_DOMAINS"),
+    )
+    max_sources_to_fetch: int = Field(default=5, validation_alias=AliasChoices("MAX_SOURCES_TO_FETCH"))
+    max_evidence_chunks: int = Field(default=12, validation_alias=AliasChoices("MAX_EVIDENCE_CHUNKS"))
+    fetch_timeout_seconds: float = Field(default=10.0, validation_alias=AliasChoices("FETCH_TIMEOUT_SECONDS"))
+    max_fetch_bytes: int = Field(default=2000000, validation_alias=AliasChoices("MAX_FETCH_BYTES"))
+    llm_json_retry_count: int = Field(default=1, validation_alias=AliasChoices("LLM_JSON_RETRY_COUNT"))
     search_provider: str = Field(default="tavily", validation_alias=AliasChoices("SEARCH_PROVIDER"))
     tavily_api_key: str | None = Field(default=None, validation_alias=AliasChoices("TAVILY_API_KEY"))
     tavily_search_depth: str = Field(default="basic", validation_alias=AliasChoices("TAVILY_SEARCH_DEPTH"))
@@ -193,6 +203,7 @@ class Settings(BaseSettings):
         "tavily_include_raw_content",
         "tavily_include_images",
         "live_evidence_enabled",
+        "enable_debug_output",
         mode="before",
     )
     @classmethod
@@ -250,6 +261,10 @@ class Settings(BaseSettings):
     @property
     def tavily_enabled(self) -> bool:
         return self.normalized_search_provider == "tavily" and bool(self.active_tavily_api_key)
+
+    @property
+    def parsed_trusted_domains(self) -> list[str]:
+        return [d.strip().lower() for d in self.trusted_domains.split(",") if d.strip()]
 
 
 @lru_cache(maxsize=1)

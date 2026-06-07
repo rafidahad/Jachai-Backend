@@ -13,6 +13,11 @@ from app.core.database import close_database, init_database
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import close_redis, init_redis
 from app.utils.errors import AppError
+from app.schemas.claim_schema import VerifyRequest, VerifyResponse
+from app.services.claim_pipeline import ClaimPipeline
+from app.db.session import get_db
+from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import Depends
 
 configure_logging()
 logger = get_logger(__name__)
@@ -45,6 +50,14 @@ if settings.backend_cors_origins:
     )
 
 app.include_router(api_router)
+
+
+@app.post("/api/claims/verify", response_model=VerifyResponse, tags=["claims"])
+async def verify_claim_direct(
+    payload: VerifyRequest,
+    session: AsyncSession = Depends(get_db),
+) -> VerifyResponse:
+    return await ClaimPipeline.verify_claim(session, payload)
 
 
 @app.get("/health", tags=["health"])

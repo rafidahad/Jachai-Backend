@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated
-
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -13,17 +11,14 @@ from app.schemas.claim_schema import (
     ClaimListResponseSchema,
     ClaimLookupResponseSchema,
     ClaimShareSummarySchema,
-    ClaimSubmissionResponseSchema,
-    ClaimTextRequest,
-    ClaimURLRequest,
     ReviewStatusUpdateRequest,
+    VerifyRequest,
+    VerifyResponse,
 )
 from app.services.claim_pipeline import (
+    ClaimPipeline,
     get_claim_by_id,
     list_claims,
-    process_image_claim,
-    process_text_claim,
-    process_url_claim,
     update_review_status,
 )
 from app.utils.errors import AppError
@@ -32,20 +27,19 @@ router = APIRouter(prefix="/claims", tags=["claims"])
 ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 
 
-@router.post("/text", response_model=ClaimSubmissionResponseSchema, dependencies=[Depends(claim_submission_rate_limit)])
-async def submit_text_claim(
-    payload: ClaimTextRequest,
+@router.post("/verify", response_model=VerifyResponse)
+async def verify_claim(
+    payload: VerifyRequest,
     session: AsyncSession = Depends(get_db),
-) -> ClaimSubmissionResponseSchema:
-    return await process_text_claim(session, payload.text, payload.external_id)
+) -> VerifyResponse:
+    return await ClaimPipeline.verify_claim(session, payload)
 
 
-@router.post("/image", response_model=ClaimSubmissionResponseSchema, dependencies=[Depends(claim_submission_rate_limit)])
-async def submit_image_claim(
+@router.post("/verify/image", response_model=VerifyResponse, dependencies=[Depends(claim_submission_rate_limit)])
+async def verify_image_claim(
     image: UploadFile = File(...),
-    external_id: Annotated[str | None, Form()] = None,
     session: AsyncSession = Depends(get_db),
-) -> ClaimSubmissionResponseSchema:
+) -> VerifyResponse:
     if not image.content_type or image.content_type not in ALLOWED_IMAGE_TYPES:
         raise AppError(
             status_code=422,
@@ -60,21 +54,14 @@ async def submit_image_claim(
             code="IMAGE_TOO_LARGE",
             message=f"Image must be {settings.max_image_size_mb} MB or smaller.",
         )
-    return await process_image_claim(
-        session,
-        image_bytes,
-        filename=image.filename,
-        content_type=image.content_type,
-        external_id=external_id,
+    from app.services.ocr_service import extract_text_from_image_with_fallback
+    text, ocr_method = await extract_text_from_image_with_fallback(image_bytes, mime_type=image.content_type)
+    payload = VerifyRequest(
+        input_type="image_ocr",
+        content=text,
+        language="auto",
     )
-
-
-@router.post("/url", response_model=ClaimSubmissionResponseSchema, dependencies=[Depends(claim_submission_rate_limit)])
-async def submit_url_claim(
-    payload: ClaimURLRequest,
-    session: AsyncSession = Depends(get_db),
-) -> ClaimSubmissionResponseSchema:
-    return await process_url_claim(session, str(payload.url), payload.external_id)
+    return await ClaimPipeline.verify_claim(session, payload)
 
 
 @router.get("/{claim_id}", response_model=ClaimLookupResponseSchema)
