@@ -5,6 +5,12 @@ from enum import Enum
 from app.core.config import settings
 
 
+RERANK_MODEL_ALIASES = {
+    "nvidia/rerank-qa-mistral-4b": "nv-rerank-qa-mistral-4b:1",
+    "rerank-qa-mistral-4b": "nv-rerank-qa-mistral-4b:1",
+}
+
+
 class NVIDIAModelTask(str, Enum):
     CLAIM_EXTRACTION = "claim_extraction"
     SEARCH_QUERY_GENERATION = "search_query_generation"
@@ -21,7 +27,8 @@ def get_model_for_task(task: NVIDIAModelTask) -> str | None:
     if task == NVIDIAModelTask.CLAIM_REASONING:
         return settings.active_nvidia_reasoning_model
     if task == NVIDIAModelTask.EVIDENCE_RERANKING:
-        return settings.active_nvidia_rerank_model
+        model = settings.active_nvidia_rerank_model
+        return RERANK_MODEL_ALIASES.get(model or "", model)
     if task == NVIDIAModelTask.IMAGE_OCR_FALLBACK:
         return settings.active_nvidia_vision_model if settings.nvidia_vision_enabled else None
     return None

@@ -16,6 +16,7 @@ class EvidenceCandidateSchema(StrictBaseModel):
     source_type: StrictStr
     snippet: StrictStr = Field(min_length=1)
     similarity_score: StrictFloat = Field(ge=0.0, le=1.0)
+    match_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     rerank_score: StrictFloat | None = None
     initial_rank: StrictInt | None = None
     final_rank: StrictInt | None = None

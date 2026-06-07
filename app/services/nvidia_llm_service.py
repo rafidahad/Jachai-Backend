@@ -102,7 +102,11 @@ Important rules:
 - Do not extract or rewrite the claim unless needed for understanding.
 - Do not use your internal knowledge as proof.
 - Do not invent sources or facts.
-- If evidence is missing, weak, loosely related, or conflicting, return "Not Enough Evidence".
+- Treat MATCH_SCORE as evidence relevance, not truth. A high match means the source is about the same topic or story.
+- If evidence confirms the same event/entity but contradicts or omits a decisive claim detail, return "Misleading" or "Likely False" instead of "Not Enough Evidence".
+- Use "Misleading" when the claim mixes a real fact with an unsupported or distorted detail.
+- Use "Likely False" when the trusted evidence directly contradicts the claim's central factual assertion.
+- Use "Not Enough Evidence" only when the supplied evidence is missing, weak, about a different story, or too conflicting to decide.
 - Do not overstate certainty.
 - Keep the explanation short and concrete.
 - Return valid JSON only.
@@ -269,12 +273,12 @@ def _normalize_payload(
     normalized["user_response"] = user_response
 
     raw_source_ids = normalized.get("used_source_ids")
-    valid_ids: list[str] = []
+    valid_ids: list[UUID] = []
     if isinstance(raw_source_ids, list):
         for source_id in raw_source_ids:
             source_str = str(source_id).strip()
             if source_str in valid_source_ids:
-                valid_ids.append(source_str)
+                valid_ids.append(UUID(source_str))
     normalized["used_source_ids"] = valid_ids
     return normalized
 

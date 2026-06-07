@@ -52,7 +52,11 @@ class EvidenceSnippetSchema(StrictBaseModel):
     source_type: StrictStr
     snippet: StrictStr
     similarity_score: StrictFloat | None = None
+    match_score: StrictFloat | None = Field(default=None, ge=0.0, le=1.0)
     rerank_score: StrictFloat | None = None
+    search_score: StrictFloat | None = None
+    trust_score: StrictFloat | None = None
+    provider: StrictStr | None = None
     initial_rank: int | None = None
     final_rank: int | None = None
 

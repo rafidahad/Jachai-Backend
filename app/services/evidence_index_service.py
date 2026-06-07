@@ -19,7 +19,7 @@ class EvidenceIndexStatus:
     message: str
 
 
-def _sample_source_filter():
+def sample_source_filter():
     seeded_by = func.lower(func.coalesce(EvidenceSource.source_meta["seeded_by"].astext, ""))
     publisher = func.lower(func.coalesce(EvidenceSource.publisher, ""))
     title = func.lower(func.coalesce(EvidenceSource.title, ""))
@@ -34,7 +34,7 @@ def _sample_source_filter():
 
 async def get_evidence_index_status(session: AsyncSession) -> EvidenceIndexStatus:
     total_sources = int(await session.scalar(select(func.count()).select_from(EvidenceSource)) or 0)
-    sample_filter = _sample_source_filter()
+    sample_filter = sample_source_filter()
     sample_sources = int(
         await session.scalar(select(func.count()).select_from(EvidenceSource).where(sample_filter)) or 0
     )

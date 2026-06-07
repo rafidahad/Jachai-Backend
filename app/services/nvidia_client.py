@@ -101,11 +101,10 @@ async def call_nvidia_rerank(
             started = perf_counter()
             logger.info("nvidia_rerank_request task=%s model=%s attempt=%s", task.value, selected_model, attempt)
             async with httpx.AsyncClient(
-                base_url=settings.nvidia_base_url,
                 timeout=settings.nvidia_timeout_seconds,
                 headers=headers,
             ) as client:
-                response = await client.post("/ranking", json=payload)
+                response = await client.post(settings.nvidia_rerank_url, json=payload)
                 response.raise_for_status()
                 body = response.json()
             logger.info(

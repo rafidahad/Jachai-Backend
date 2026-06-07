@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import re
 from typing import Any
 from uuid import UUID
 
@@ -35,6 +37,61 @@ from app.utils.errors import AppError
 from app.utils.hashing import normalized_hash
 from app.utils.time import utc_now
 
+TOKEN_PATTERN = re.compile(r"[\w']+", re.UNICODE)
+MATCH_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "been",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "was",
+    "were",
+    "with",
+}
+MATCH_TOKEN_ALIASES = {
+    "buffaloes": "buffalo",
+    "cattle": "buffalo",
+    "cow": "buffalo",
+    "cows": "buffalo",
+    "mahish": "buffalo",
+    "mohis": "buffalo",
+    "mohish": "buffalo",
+    "mohishh": "buffalo",
+    "mosh": "buffalo",
+    "মহিষ": "buffalo",
+    "eidaladha": "sacrifice",
+    "eiduladha": "sacrifice",
+    "korban": "sacrifice",
+    "korbani": "sacrifice",
+    "kurban": "sacrifice",
+    "qorbani": "sacrifice",
+    "qurbani": "sacrifice",
+    "sacrificed": "sacrifice",
+    "sacrificing": "sacrifice",
+    "কোরবানি": "sacrifice",
+    "কুরবানি": "sacrifice",
+}
+
 
 def _parse_uuid(value: UUID | str, *, code: str, message: str) -> UUID:
     if isinstance(value, UUID):
@@ -53,25 +110,147 @@ def _confidence_label_from_score(score: float) -> str:
     return "Low"
 
 
+def _canonical_match_token(token: str) -> str:
+    normalized = token.lower().strip("'")
+    if normalized.endswith("'s"):
+        normalized = normalized[:-2]
+    normalized = normalized.replace("-", "")
+    return MATCH_TOKEN_ALIASES.get(normalized, normalized)
+
+
+def _tokens_for_match(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for token in TOKEN_PATTERN.findall(text):
+        canonical = _canonical_match_token(token)
+        if len(canonical) < 3 or canonical in MATCH_STOPWORDS:
+            continue
+        tokens.add(canonical)
+    return tokens
+
+
+def _token_overlap_score(claim_text: str, evidence_text: str) -> float:
+    claim_tokens = _tokens_for_match(claim_text)
+    if not claim_tokens:
+        return 0.0
+    evidence_tokens = _tokens_for_match(evidence_text)
+    if not evidence_tokens:
+        return 0.0
+    overlap = claim_tokens & evidence_tokens
+    return min(1.0, len(overlap) / len(claim_tokens))
+
+
+def _normalized_search_score(value: Any) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if score <= 0:
+        return 0.0
+    if score <= 1:
+        return min(1.0, math.sqrt(score))
+    return min(1.0, score / 100.0)
+
+
+def _calculate_match_score(
+    *,
+    claim_text: str,
+    title: str,
+    snippet: str,
+    text_content: str,
+    similarity_score: float,
+    search_score: Any,
+) -> tuple[float, float]:
+    compact_content = text_content[:4000]
+    body_overlap = _token_overlap_score(claim_text, f"{title} {snippet} {compact_content}")
+    title_overlap = _token_overlap_score(claim_text, title)
+    lexical_score = max(body_overlap, title_overlap * 0.9)
+    retrieval_score = max(0.0, min(1.0, float(similarity_score)))
+    normalized_search = _normalized_search_score(search_score)
+    match_score = max(retrieval_score, lexical_score, normalized_search * 0.7)
+    return round(min(1.0, match_score), 4), round(lexical_score, 4)
+
+
+def _evidence_relevance_score(item: dict[str, Any]) -> float:
+    scores: list[float] = []
+    for key in ("match_score", "similarity_score", "lexical_overlap_score"):
+        try:
+            scores.append(float(item.get(key) or 0.0))
+        except (TypeError, ValueError):
+            continue
+    return max(scores) if scores else 0.0
+
+
+def _is_relevant_evidence(item: dict[str, Any]) -> bool:
+    return _evidence_relevance_score(item) >= settings.min_relevant_similarity
+
+
+def _looks_like_unsupported_detail(explanation: str, user_response: str) -> bool:
+    text = f"{explanation} {user_response}".lower()
+    markers = (
+        "does not mention",
+        "doesn't mention",
+        "do not mention",
+        "no mention",
+        "not mention",
+        "does not support",
+        "do not support",
+        "unsupported",
+        "but not",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _source_ids_from_evidence(evidence: list[dict[str, Any]], *, limit: int = 3) -> list[UUID]:
+    source_ids: list[UUID] = []
+    for item in evidence:
+        try:
+            source_ids.append(UUID(str(item["source_id"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if len(source_ids) >= limit:
+            break
+    return source_ids
+
+
+def _filter_selected_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    relevant = [item for item in evidence if _is_relevant_evidence(item)]
+    if not relevant:
+        return evidence
+
+    filtered: list[dict[str, Any]] = []
+    for final_rank, item in enumerate(relevant[: settings.final_evidence_top_k], start=1):
+        ranked_item = dict(item)
+        ranked_item["final_rank"] = final_rank
+        filtered.append(ranked_item)
+    return filtered
+
+
 def _build_reasoning_text(
     verdict: LLMVerdictSchema,
     evidence: list[dict[str, Any]],
     *,
     rerank_applied: bool,
 ) -> str:
-    relevant_count = sum(
-        1 for item in evidence if float(item.get("similarity_score", 0.0)) >= settings.min_relevant_similarity
-    )
+    relevant_count = sum(1 for item in evidence if _is_relevant_evidence(item))
     return (
         f"Evaluated {len(evidence)} evidence source(s), used {len(verdict.used_source_ids)} source(s) in the final "
-        f"answer, {relevant_count} met the similarity threshold of {settings.min_relevant_similarity:.2f}, "
+        f"answer, {relevant_count} met the relevance threshold of {settings.min_relevant_similarity:.2f}, "
         f"and reranking was {'applied' if rerank_applied else 'not applied'}."
     )
 
 
-def _build_evidence_candidates(retrieved: list[tuple[Any, float]]) -> list[dict[str, Any]]:
+def _build_evidence_candidates(retrieved: list[tuple[Any, float]], *, claim_text: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for initial_rank, (source, similarity_score) in enumerate(retrieved, start=1):
+        metadata = source.source_meta or {}
+        match_score, lexical_overlap_score = _calculate_match_score(
+            claim_text=claim_text,
+            title=source.title,
+            snippet=source.snippet,
+            text_content=source.text_content,
+            similarity_score=float(similarity_score),
+            search_score=metadata.get("search_score"),
+        )
         candidate = EvidenceCandidateSchema(
             source_id=source.id,
             title=source.title,
@@ -81,9 +260,19 @@ def _build_evidence_candidates(retrieved: list[tuple[Any, float]]) -> list[dict[
             source_type=source.source_type,
             snippet=source.snippet,
             similarity_score=float(similarity_score),
+            match_score=match_score,
             initial_rank=initial_rank,
         )
-        candidates.append(candidate.model_dump(mode="json"))
+        candidate_payload = candidate.model_dump(mode="json")
+        candidate_payload.update(
+            {
+                "lexical_overlap_score": lexical_overlap_score,
+                "search_score": metadata.get("search_score"),
+                "trust_score": metadata.get("trust_score"),
+                "provider": metadata.get("provider"),
+            }
+        )
+        candidates.append(candidate_payload)
     return candidates
 
 
@@ -94,9 +283,11 @@ def _build_ai_usage_payload(
     reasoning_model: str | None,
     rerank_model: str | None,
     vision_model: str | None,
+    search_provider: str | None,
     llm_call_count: int,
     rerank_call_count: int,
     vision_call_count: int,
+    tavily_request_count: int,
 ) -> dict[str, Any]:
     return AIUsageSchema(
         embedding_model=settings.embedding_model,
@@ -105,9 +296,11 @@ def _build_ai_usage_payload(
         rerank_model=rerank_model,
         reasoning_model=reasoning_model,
         vision_model=vision_model,
+        search_provider=search_provider,
         llm_call_count=llm_call_count,
         rerank_call_count=rerank_call_count,
         vision_call_count=vision_call_count,
+        tavily_request_count=tavily_request_count,
     ).model_dump(mode="json")
 
 
@@ -120,9 +313,8 @@ def _apply_verdict_guardrails(
 ) -> LLMVerdictSchema:
     valid_source_ids = {str(item["source_id"]) for item in evidence if item.get("source_id")}
     filtered_source_ids = [source_id for source_id in verdict.used_source_ids if str(source_id) in valid_source_ids]
-    relevant_evidence = [
-        item for item in evidence if float(item.get("similarity_score", 0.0)) >= settings.min_relevant_similarity
-    ]
+    relevant_evidence = [item for item in evidence if _is_relevant_evidence(item)]
+    trusted_evidence = [item for item in relevant_evidence if float(item.get("trust_score") or 0.50) > 0.50]
 
     extracted_claim = verdict.extracted_claim or claim_text
     detected_language = verdict.detected_language or language or "Unknown"
@@ -154,6 +346,24 @@ def _apply_verdict_guardrails(
         )
         filtered_source_ids = []
 
+    if (
+        verdict_label == "Not Enough Evidence"
+        and trusted_evidence
+        and _looks_like_unsupported_detail(explanation, user_response)
+    ):
+        verdict_label = "Misleading"
+        confidence = max(min(confidence, 0.65), 0.55)
+        confidence_label = "Medium"
+        explanation = (
+            "Trusted sources confirm a related real story, but they do not support the claim's decisive added detail."
+        )
+        user_response = (
+            "JachAI Verdict: Misleading. Trusted sources match the same broad story, but the evidence does not "
+            "support the added detail in the claim."
+        )
+        if not filtered_source_ids:
+            filtered_source_ids = _source_ids_from_evidence(trusted_evidence)
+
     if verdict_label in {"Likely True", "Likely False"} and not filtered_source_ids:
         verdict_label = "Not Enough Evidence"
         confidence = min(confidence, 0.35)
@@ -171,6 +381,19 @@ def _apply_verdict_guardrails(
     if not filtered_source_ids and verdict_label == "Misleading" and confidence > 0.65:
         confidence = 0.65
         confidence_label = "Medium"
+
+    if verdict_label in {"Likely True", "Likely False", "Misleading"} and not trusted_evidence:
+        confidence = min(confidence, 0.65)
+        confidence_label = "Medium" if confidence >= 0.5 else "Low"
+        if verdict_label in {"Likely True", "Likely False"}:
+            verdict_label = "Not Enough Evidence"
+            confidence = min(confidence, 0.45)
+            confidence_label = "Low"
+            explanation = "A strong verdict needs support from at least one trusted domain."
+            user_response = (
+                "JachAI Verdict: Not Enough Evidence. The available sources are not trusted enough for a strong "
+                "true or false verdict."
+            )
 
     if not confidence_label:
         confidence_label = _confidence_label_from_score(confidence)
@@ -233,7 +456,11 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
             source_type=link.source.source_type,
             snippet=link.source.snippet,
             similarity_score=float(evidence_metadata.get(str(link.source.id), {}).get("similarity_score", link.similarity_score)),
+            match_score=evidence_metadata.get(str(link.source.id), {}).get("match_score"),
             rerank_score=evidence_metadata.get(str(link.source.id), {}).get("rerank_score"),
+            search_score=evidence_metadata.get(str(link.source.id), {}).get("search_score"),
+            trust_score=evidence_metadata.get(str(link.source.id), {}).get("trust_score"),
+            provider=evidence_metadata.get(str(link.source.id), {}).get("provider"),
             initial_rank=evidence_metadata.get(str(link.source.id), {}).get("initial_rank"),
             final_rank=evidence_metadata.get(str(link.source.id), {}).get("final_rank", link.rank),
         )
@@ -381,7 +608,14 @@ async def _pipeline_from_text(
             raise AppError(status_code=422, code="INPUT_TOO_SHORT", message="Claim text is too short.")
         masked_text = mask_pii(cleaned_text)
         language = detect_language(masked_text)
-        hash_value = normalized_hash(masked_text)
+        content_hash = normalized_hash(masked_text)
+        hash_value = normalized_hash(f"{settings.verification_pipeline_version}:{content_hash}")
+        claim_context.update(
+            {
+                "content_hash": content_hash,
+                "verification_pipeline_version": settings.verification_pipeline_version,
+            }
+        )
 
         job.normalized_hash = hash_value
         await session.commit()
@@ -437,20 +671,19 @@ async def _pipeline_from_text(
         claim_context["live_evidence"] = live_evidence
 
         evidence_index = await get_evidence_index_status(session)
-        if not evidence_index.ready:
-            raise AppError(
-                status_code=503,
-                code="EVIDENCE_INDEX_NOT_READY",
-                message=(
-                    f"{evidence_index.message} Ingest real trusted sources through /api/v1/sources/ingest "
-                    "before verifying claims."
-                ),
-            )
+        claim_context["evidence_index"] = {
+            "ready": evidence_index.ready,
+            "total_sources": evidence_index.total_sources,
+            "real_sources": evidence_index.real_sources,
+            "sample_sources": evidence_index.sample_sources,
+            "message": evidence_index.message,
+        }
 
         embedding = await embed_text(retrieval_query)
         retrieved = await retrieve_evidence(session, embedding, top_k=settings.pgvector_top_k)
-        retrieved_candidates = _build_evidence_candidates(retrieved)
+        retrieved_candidates = _build_evidence_candidates(retrieved, claim_text=retrieval_query)
         selected_evidence, rerank_metadata = await rerank_evidence(retrieval_query, retrieved_candidates)
+        selected_evidence = _filter_selected_evidence(selected_evidence)
 
         verdict, llm_metadata = await generate_verdict(extraction, selected_evidence)
         verdict = _apply_verdict_guardrails(
@@ -471,6 +704,7 @@ async def _pipeline_from_text(
             reasoning_model=reasoning_model,
             rerank_model=rerank_model,
             vision_model=vision_model,
+            search_provider="tavily",
             llm_call_count=(
                 int(extraction_metadata.get("call_count", 0))
                 + int(query_metadata.get("call_count", 0))
@@ -478,6 +712,7 @@ async def _pipeline_from_text(
             ),
             rerank_call_count=int(rerank_metadata.get("call_count", 0)),
             vision_call_count=1 if claim_context.get("ocr_method") == "nvidia_vision_fallback" else 0,
+            tavily_request_count=int(live_evidence.get("tavily_request_count", 0)),
         )
         claim_context.update(
             {
@@ -486,6 +721,7 @@ async def _pipeline_from_text(
                 "category": verdict.category,
                 "confidence_label": verdict.confidence_label,
                 "user_response": verdict.user_response,
+                "factual_summary": verdict.user_response,
                 "claim_extraction_model": claim_extraction_model,
                 "query_generation_model": query_generation_model,
                 "nvidia_reasoning_model": reasoning_model,
@@ -497,6 +733,8 @@ async def _pipeline_from_text(
                     "queries": query_generation.search_queries,
                     "call_count": int(query_metadata.get("call_count", 0)),
                 },
+                "search_answer_context": live_evidence.get("search_answer_context"),
+                "search_provider": "tavily",
                 "retrieval": {
                     "candidate_count": len(retrieved_candidates),
                     "selected_count": len(selected_evidence),
@@ -567,6 +805,8 @@ async def _pipeline_from_text(
                 entity_id=str(claim.id),
                 details={
                     "normalized_hash": hash_value,
+                    "content_hash": content_hash,
+                    "verification_pipeline_version": settings.verification_pipeline_version,
                     "language": language,
                     "input_type": input_type,
                     "ai_usage": ai_usage,

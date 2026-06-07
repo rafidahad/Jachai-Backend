@@ -9,7 +9,7 @@ from pydantic import Field, HttpUrl, StrictBool, StrictInt, StrictStr
 from app.schemas.common import StrictBaseModel
 from app.schemas.verdict_schema import LanguageLabel
 
-SourceType = Literal["article", "fact_check", "government", "research", "social_post", "other"]
+SourceType = Literal["article", "fact_check", "government", "research", "social_post", "tavily_search", "other"]
 
 
 class SourceIngestItemSchema(StrictBaseModel):

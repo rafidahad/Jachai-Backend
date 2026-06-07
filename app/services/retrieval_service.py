@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, not_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.evidence_source import EvidenceSource
+from app.services.evidence_index_service import sample_source_filter
 
 
 async def retrieve_evidence(
@@ -17,6 +18,7 @@ async def retrieve_evidence(
     statement: Select = (
         select(EvidenceSource, distance.label("distance"))
         .where(EvidenceSource.embedding.is_not(None))
+        .where(not_(sample_source_filter()))
         .order_by(distance)
         .limit(limit)
     )

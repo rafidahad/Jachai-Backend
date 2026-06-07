@@ -113,19 +113,13 @@ async def get_system_health() -> HealthResponseSchema:
             message=evidence_index_message,
         ),
         ComponentHealthSchema(
-            name="general_search_api",
-            status=(
-                "healthy"
-                if (not settings.general_search_enabled or settings.general_search_api_key)
-                else "degraded"
-            ),
-            ok=(not settings.general_search_enabled or bool(settings.general_search_api_key)),
+            name="tavily_search",
+            status="healthy" if settings.tavily_enabled else "degraded",
+            ok=settings.tavily_enabled,
             message=(
-                f"General search provider '{settings.normalized_search_provider}' is configured."
-                if settings.general_search_enabled and settings.general_search_api_key
-                else "General search API is disabled; using Google Fact Check API and trusted catalog only."
-                if not settings.general_search_enabled
-                else f"General search provider '{settings.normalized_search_provider}' needs GENERAL_SEARCH_API_KEY."
+                "Tavily search is configured."
+                if settings.tavily_enabled
+                else "Tavily search requires SEARCH_PROVIDER=tavily and TAVILY_API_KEY or GENERAL_SEARCH_API_KEY."
             ),
         ),
     ]

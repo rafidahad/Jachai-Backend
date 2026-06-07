@@ -12,7 +12,7 @@ class TrustedPublisherCatalog:
     region: str
     base_domain: str
     listing_urls: tuple[str, ...]
-    google_review_site: str | None = None
+    review_site: str | None = None
 
 
 TRUSTED_PUBLISHER_CATALOGS: tuple[TrustedPublisherCatalog, ...] = (
@@ -27,7 +27,7 @@ TRUSTED_PUBLISHER_CATALOGS: tuple[TrustedPublisherCatalog, ...] = (
             "https://rumorscanner.com/en",
             "https://rumorscanner.com/archives",
         ),
-        google_review_site="rumorscanner.com",
+        review_site="rumorscanner.com",
     ),
     TrustedPublisherCatalog(
         name="fact_watch",
@@ -36,7 +36,7 @@ TRUSTED_PUBLISHER_CATALOGS: tuple[TrustedPublisherCatalog, ...] = (
         region="bangladesh",
         base_domain="fact-watch.org",
         listing_urls=("https://www.fact-watch.org/",),
-        google_review_site="fact-watch.org",
+        review_site="fact-watch.org",
     ),
     TrustedPublisherCatalog(
         name="prothom_alo",
@@ -77,7 +77,7 @@ TRUSTED_PUBLISHER_CATALOGS: tuple[TrustedPublisherCatalog, ...] = (
         region="international",
         base_domain="reuters.com",
         listing_urls=("https://www.reuters.com/fact-check/",),
-        google_review_site="reuters.com",
+        review_site="reuters.com",
     ),
     TrustedPublisherCatalog(
         name="associated_press_fact_check",
@@ -86,7 +86,7 @@ TRUSTED_PUBLISHER_CATALOGS: tuple[TrustedPublisherCatalog, ...] = (
         region="international",
         base_domain="apnews.com",
         listing_urls=("https://apnews.com/hub/ap-fact-check",),
-        google_review_site="apnews.com",
+        review_site="apnews.com",
     ),
     TrustedPublisherCatalog(
         name="afp_fact_check",
@@ -95,7 +95,7 @@ TRUSTED_PUBLISHER_CATALOGS: tuple[TrustedPublisherCatalog, ...] = (
         region="international",
         base_domain="factcheck.afp.com",
         listing_urls=("https://factcheck.afp.com/",),
-        google_review_site="factcheck.afp.com",
+        review_site="factcheck.afp.com",
     ),
     TrustedPublisherCatalog(
         name="factcheck_org",
@@ -104,7 +104,7 @@ TRUSTED_PUBLISHER_CATALOGS: tuple[TrustedPublisherCatalog, ...] = (
         region="international",
         base_domain="factcheck.org",
         listing_urls=("https://www.factcheck.org/",),
-        google_review_site="factcheck.org",
+        review_site="factcheck.org",
     ),
     TrustedPublisherCatalog(
         name="snopes",
@@ -113,7 +113,7 @@ TRUSTED_PUBLISHER_CATALOGS: tuple[TrustedPublisherCatalog, ...] = (
         region="international",
         base_domain="snopes.com",
         listing_urls=("https://www.snopes.com/fact-check/",),
-        google_review_site="snopes.com",
+        review_site="snopes.com",
     ),
     TrustedPublisherCatalog(
         name="full_fact",
@@ -122,7 +122,7 @@ TRUSTED_PUBLISHER_CATALOGS: tuple[TrustedPublisherCatalog, ...] = (
         region="international",
         base_domain="fullfact.org",
         listing_urls=("https://fullfact.org/latest/",),
-        google_review_site="fullfact.org",
+        review_site="fullfact.org",
     ),
     TrustedPublisherCatalog(
         name="bbc_news",
@@ -137,15 +137,6 @@ TRUSTED_PUBLISHER_CATALOGS: tuple[TrustedPublisherCatalog, ...] = (
 
 def iter_trusted_catalogs() -> tuple[TrustedPublisherCatalog, ...]:
     return TRUSTED_PUBLISHER_CATALOGS
-
-
-def trusted_google_review_sites() -> list[str]:
-    sites: list[str] = []
-    for catalog in TRUSTED_PUBLISHER_CATALOGS:
-        site = catalog.google_review_site
-        if site and site not in sites:
-            sites.append(site)
-    return sites
 
 
 def hostname_matches_trusted_domain(hostname: str | None, domain: str) -> bool:

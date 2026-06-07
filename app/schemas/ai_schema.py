@@ -12,6 +12,8 @@ class AIUsageSchema(StrictBaseModel):
     rerank_model: StrictStr | None = None
     reasoning_model: StrictStr | None = None
     vision_model: StrictStr | None = None
+    search_provider: StrictStr | None = None
     llm_call_count: StrictInt = 0
     rerank_call_count: StrictInt = 0
     vision_call_count: StrictInt = 0
+    tavily_request_count: StrictInt = 0

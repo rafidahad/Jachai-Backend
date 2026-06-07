@@ -22,19 +22,15 @@ class Settings(BaseSettings):
     app_env: str = Field(default="development", validation_alias=AliasChoices("APP_ENV", "ENVIRONMENT"))
     debug: bool = Field(default=False, validation_alias=AliasChoices("DEBUG"))
     api_v1_prefix: str = Field(default="/api/v1", validation_alias=AliasChoices("API_V1_PREFIX"))
+    verification_pipeline_version: str = Field(
+        default="tavily-live-evidence-v10",
+        validation_alias=AliasChoices("VERIFICATION_PIPELINE_VERSION"),
+    )
     database_url: str = Field(validation_alias=AliasChoices("DATABASE_URL"))
     database_sync_url: str = Field(validation_alias=AliasChoices("DATABASE_SYNC_URL"))
     redis_url: str = Field(validation_alias=AliasChoices("REDIS_URL"))
     nvidia_api_key: str = Field(validation_alias=AliasChoices("NVIDIA_API_KEY"))
     nvidia_base_url: str = Field(validation_alias=AliasChoices("NVIDIA_BASE_URL"))
-    google_fact_check_api_key: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("GOOGLE_FACT_CHECK_API_KEY"),
-    )
-    google_fact_check_enabled: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("GOOGLE_FACT_CHECK_ENABLED"),
-    )
     nvidia_llm_model: str | None = Field(default=None, validation_alias=AliasChoices("NVIDIA_LLM_MODEL"))
     nvidia_reasoning_model: str | None = Field(
         default=None,
@@ -49,8 +45,12 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("NVIDIA_QUERY_MODEL", "NVIDIA_SEARCH_QUERY_MODEL"),
     )
     nvidia_rerank_model: str | None = Field(
-        default="nvidia/rerank-qa-mistral-4b",
+        default="nv-rerank-qa-mistral-4b:1",
         validation_alias=AliasChoices("NVIDIA_RERANK_MODEL"),
+    )
+    nvidia_rerank_url: str = Field(
+        default="https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking",
+        validation_alias=AliasChoices("NVIDIA_RERANK_URL", "NVIDIA_RERANK_ENDPOINT"),
     )
     nvidia_vision_model: str | None = Field(default=None, validation_alias=AliasChoices("NVIDIA_VISION_MODEL"))
     nvidia_enable_vision_fallback: bool = Field(
@@ -96,7 +96,17 @@ class Settings(BaseSettings):
     ocr_languages: str = Field(default="eng+ben+hin", validation_alias=AliasChoices("OCR_LANGUAGES"))
     max_image_size_mb: int = Field(default=8, validation_alias=AliasChoices("MAX_IMAGE_SIZE_MB"))
     request_timeout_seconds: float = 15.0
-    search_provider: str = Field(default="google_fact_check", validation_alias=AliasChoices("SEARCH_PROVIDER"))
+    search_provider: str = Field(default="tavily", validation_alias=AliasChoices("SEARCH_PROVIDER"))
+    tavily_api_key: str | None = Field(default=None, validation_alias=AliasChoices("TAVILY_API_KEY"))
+    tavily_search_depth: str = Field(default="basic", validation_alias=AliasChoices("TAVILY_SEARCH_DEPTH"))
+    tavily_topic: str = Field(default="news", validation_alias=AliasChoices("TAVILY_TOPIC"))
+    tavily_include_answer: bool = Field(default=True, validation_alias=AliasChoices("TAVILY_INCLUDE_ANSWER"))
+    tavily_include_raw_content: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("TAVILY_INCLUDE_RAW_CONTENT"),
+    )
+    tavily_include_images: bool = Field(default=False, validation_alias=AliasChoices("TAVILY_INCLUDE_IMAGES"))
+    tavily_max_results: int = Field(default=5, validation_alias=AliasChoices("TAVILY_MAX_RESULTS"))
     general_search_api_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices("GENERAL_SEARCH_API_KEY"),
@@ -105,7 +115,7 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("GENERAL_SEARCH_BASE_URL"),
     )
-    general_search_max_results: int = Field(default=8, validation_alias=AliasChoices("GENERAL_SEARCH_MAX_RESULTS"))
+    general_search_max_results: int = Field(default=5, validation_alias=AliasChoices("GENERAL_SEARCH_MAX_RESULTS"))
     live_evidence_enabled: bool = Field(
         default=True,
         validation_alias=AliasChoices("LIVE_EVIDENCE_ENABLED"),
@@ -117,10 +127,6 @@ class Settings(BaseSettings):
     live_evidence_max_documents: int = Field(
         default=10,
         validation_alias=AliasChoices("LIVE_EVIDENCE_MAX_DOCUMENTS"),
-    )
-    live_evidence_max_google_results: int = Field(
-        default=6,
-        validation_alias=AliasChoices("LIVE_EVIDENCE_MAX_GOOGLE_RESULTS"),
     )
     live_evidence_max_listing_links_per_catalog: int = Field(
         default=8,
@@ -183,7 +189,9 @@ class Settings(BaseSettings):
     @field_validator(
         "debug",
         "nvidia_enable_vision_fallback",
-        "google_fact_check_enabled",
+        "tavily_include_answer",
+        "tavily_include_raw_content",
+        "tavily_include_images",
         "live_evidence_enabled",
         mode="before",
     )
@@ -236,8 +244,12 @@ class Settings(BaseSettings):
         return self.search_provider.strip().lower().replace("-", "_")
 
     @property
-    def general_search_enabled(self) -> bool:
-        return self.normalized_search_provider not in {"", "none", "disabled", "google_fact_check"}
+    def active_tavily_api_key(self) -> str | None:
+        return self.tavily_api_key or self.general_search_api_key
+
+    @property
+    def tavily_enabled(self) -> bool:
+        return self.normalized_search_provider == "tavily" and bool(self.active_tavily_api_key)
 
 
 @lru_cache(maxsize=1)

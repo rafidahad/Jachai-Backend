@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import math
-import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -14,38 +12,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.models.search_run import SearchResultRecord, SearchRun
 from app.schemas.source_schema import SourceIngestItemSchema
-from app.services.google_fact_check_service import GoogleFactCheckMatch, search_google_fact_checks
 from app.services.language_service import detect_language
-from app.services.search_service import SearchResult, search_general_web
+from app.services.search_service import (
+    MIN_TAVILY_CONTENT_CHARACTERS,
+    NormalizedSearchResult,
+    TavilySearchResponse,
+    dedupe_search_results,
+    normalize_search_url,
+    normalize_tavily_response,
+    search_with_tavily,
+)
 from app.services.source_service import ingest_sources
 from app.services.text_cleaning_service import clean_text
-from app.services.trusted_publisher_registry import (
-    TrustedPublisherCatalog,
-    get_catalog_for_url,
-    hostname_matches_trusted_domain,
-    is_trusted_url,
-    iter_trusted_catalogs,
-)
+from app.utils.hashing import normalized_hash
 
 logger = get_logger(__name__)
 
-TOKEN_RE = re.compile(r"[0-9A-Za-z\u0980-\u09FF\u0900-\u097F]{3,}")
-DROP_QUERY_KEYS = {
-    "fbclid",
-    "gclid",
-    "igshid",
-    "mc_cid",
-    "mc_eid",
-    "ref",
-    "source",
-    "spm",
-    "utm_campaign",
-    "utm_content",
-    "utm_medium",
-    "utm_source",
-    "utm_term",
-}
 HTML_LANGUAGE_MAP = {
     "bn": "Bangla",
     "en": "English",
@@ -65,47 +49,17 @@ class LiveEvidenceDocument:
     metadata: dict[str, Any]
 
 
-@dataclass(slots=True)
-class LinkCandidate:
-    url: str
-    anchor_text: str
-    score: float
-
-
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _normalize_url(url: str) -> str:
-    parts = urlsplit(url.strip())
-    filtered_query = [
-        (key, value)
-        for key, value in parse_qsl(parts.query, keep_blank_values=True)
-        if key.lower() not in DROP_QUERY_KEYS
-    ]
-    normalized_parts = parts._replace(query=urlencode(filtered_query, doseq=True), fragment="")
-    return urlunsplit(normalized_parts)
-
-
-def _tokenize(value: str) -> set[str]:
-    return {token.lower() for token in TOKEN_RE.findall(value)}
-
-
-def _token_overlap_score(query_tokens: set[str], value: str) -> float:
-    if not query_tokens:
-        return 0.0
-    candidate_tokens = _tokenize(value)
-    if not candidate_tokens:
-        return 0.0
-    intersection = len(query_tokens & candidate_tokens)
-    if not intersection:
-        return 0.0
-    return intersection / math.sqrt(len(query_tokens) * len(candidate_tokens))
+def _domain_from_url(url: str) -> str:
+    return (urlsplit(url).hostname or "unknown").lower().removeprefix("www.")
 
 
 def _build_request_headers() -> dict[str, str]:
     return {
-        "User-Agent": "JachAI/0.1 (+https://github.com/openai)",
+        "User-Agent": "JachAI/0.1",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.8,bn;q=0.7,hi;q=0.6",
     }
@@ -116,19 +70,6 @@ def _normalize_html_language(value: str | None) -> str | None:
         return None
     prefix = value.split("-", 1)[0].strip().lower()
     return HTML_LANGUAGE_MAP.get(prefix)
-
-
-def _catalogs_for_language(language: str) -> list[TrustedPublisherCatalog]:
-    normalized_language = (language or "").strip()
-    selected: list[TrustedPublisherCatalog] = []
-    for catalog in iter_trusted_catalogs():
-        if catalog.region == "bangladesh":
-            if normalized_language in {"Bangla", "Banglish", "Hindi", "Hinglish", "Mixed", "Unknown", ""}:
-                selected.append(catalog)
-            continue
-
-        selected.append(catalog)
-    return selected
 
 
 def _build_live_search_queries(claim_text: str, search_queries: list[str] | None) -> list[str]:
@@ -165,7 +106,6 @@ def _article_text_from_html(html: str) -> tuple[str, str, str | None, str | None
         _extract_meta_content(soup, ("property", "og:title"), ("name", "twitter:title"))
         or clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
     )
-
     description = _extract_meta_content(
         soup,
         ("name", "description"),
@@ -182,220 +122,95 @@ def _article_text_from_html(html: str) -> tuple[str, str, str | None, str | None
     return title, text_content, description, language
 
 
-async def _fetch_document(
-    client: httpx.AsyncClient,
-    url: str,
-    *,
-    catalog: TrustedPublisherCatalog | None,
-    base_metadata: dict[str, Any],
-) -> LiveEvidenceDocument | None:
-    normalized_url = _normalize_url(url)
-    if not is_trusted_url(normalized_url):
-        return None
-
-    try:
-        response = await client.get(normalized_url, headers=_build_request_headers(), follow_redirects=True)
-        response.raise_for_status()
-    except Exception:
-        logger.exception("trusted_evidence_fetch_failed url=%s", normalized_url)
-        return None
-
-    final_url = _normalize_url(str(response.url))
-    final_catalog = get_catalog_for_url(final_url) or catalog
-    if final_catalog is None:
-        return None
-
+async def _crawl_result_url(client: httpx.AsyncClient, result: NormalizedSearchResult) -> tuple[str, str, str | None]:
+    response = await client.get(result.url, headers=_build_request_headers(), follow_redirects=True)
+    response.raise_for_status()
+    final_url = normalize_search_url(str(response.url))
     title, text_content, description, html_language = _article_text_from_html(response.text)
-    if len(text_content) < settings.live_evidence_min_article_characters:
-        return None
+    if final_url != result.url:
+        result.url = final_url
+        result.domain = _domain_from_url(final_url)
+    return title, text_content, description or result.snippet, html_language
 
-    snippet = description or text_content[:280]
+
+async def _document_from_search_result(
+    client: httpx.AsyncClient,
+    result: NormalizedSearchResult,
+    *,
+    search_answer: str | None,
+    search_run_id: str,
+) -> LiveEvidenceDocument | None:
+    content = clean_text(result.content or "")
+    title = result.title
+    snippet = result.snippet or content[:320]
+    html_language: str | None = None
+
+    if len(content) < MIN_TAVILY_CONTENT_CHARACTERS:
+        result.selected_for_crawl = True
+        try:
+            crawled_title, crawled_text, crawled_snippet, html_language = await _crawl_result_url(client, result)
+        except Exception:
+            logger.exception("tavily_result_crawl_failed url=%s", result.url)
+            return None
+        content = clean_text(crawled_text)
+        if len(content) < settings.live_evidence_min_article_characters:
+            return None
+        title = crawled_title or title
+        snippet = crawled_snippet or content[:320]
+
+    domain = result.domain or _domain_from_url(result.url)
+    language = detect_language(content)
+    if not language or language == "Unknown":
+        language = _normalize_html_language(html_language) or "Unknown"
+
+    snippet = clean_text(snippet or content[:320])
     if len(snippet) > 320:
         snippet = snippet[:317].rstrip() + "..."
 
-    language = detect_language(text_content)
-    if not language or language == "Unknown":
-        language = _normalize_html_language(html_language) or "Unknown"
     metadata = {
-        **base_metadata,
+        "seeded_by": "live_tavily_lookup",
+        "source_channel": "tavily_search",
+        "provider": "tavily",
+        "request_id": result.request_id,
+        "generated_query": result.query,
+        "query_list": result.query_list or [result.query],
+        "search_answer": search_answer,
+        "search_score": result.search_score,
+        "trust_score": result.trust_score,
+        "domain": domain,
+        "favicon": result.favicon,
+        "selected_for_crawl": result.selected_for_crawl,
+        "content_hash": normalized_hash(content),
         "fetched_at": _utc_now_iso(),
-        "final_url": final_url,
-        "catalog": final_catalog.name,
-        "publisher_domain": final_catalog.base_domain,
+        "final_url": result.url,
+        "search_run_id": search_run_id,
     }
     return LiveEvidenceDocument(
-        title=title or text_content[:120],
-        url=final_url,
-        publisher=final_catalog.publisher,
+        title=(clean_text(title) or result.url)[:255],
+        url=result.url,
+        publisher=domain,
         language=language,
-        source_type=final_catalog.source_type,
-        snippet=clean_text(snippet),
-        text_content=text_content,
+        source_type="tavily_search",
+        snippet=snippet,
+        text_content=content,
         metadata=metadata,
     )
 
 
-def _extract_same_domain_links(
-    html: str,
-    *,
-    listing_url: str,
-    catalog: TrustedPublisherCatalog,
-    query_tokens: set[str],
-) -> list[LinkCandidate]:
-    soup = BeautifulSoup(html, "html.parser")
-    candidates: dict[str, LinkCandidate] = {}
-    for anchor in soup.find_all("a", href=True):
-        href = clean_text(str(anchor.get("href") or ""))
-        if not href:
-            continue
-        absolute_url = _normalize_url(urljoin(listing_url, href))
-        parsed = urlsplit(absolute_url)
-        if parsed.scheme not in {"http", "https"}:
-            continue
-        if not hostname_matches_trusted_domain(parsed.hostname, catalog.base_domain):
-            continue
-        if any(part in absolute_url for part in ("/tag/", "/author/", "/category/", "/video/", "/contact", "/about")):
-            continue
-        anchor_text = clean_text(anchor.get_text(" ", strip=True))
-        if not anchor_text:
-            continue
-        score = _token_overlap_score(query_tokens, f"{anchor_text} {absolute_url}")
-        existing = candidates.get(absolute_url)
-        candidate = LinkCandidate(url=absolute_url, anchor_text=anchor_text, score=score)
-        if existing is None or candidate.score > existing.score:
-            candidates[absolute_url] = candidate
-
-    ordered = sorted(candidates.values(), key=lambda item: (item.score, len(item.anchor_text)), reverse=True)
-    if ordered:
-        return ordered[: settings.live_evidence_max_listing_links_per_catalog]
-    return []
-
-
-async def _discover_catalog_documents(
-    client: httpx.AsyncClient,
-    *,
-    catalog: TrustedPublisherCatalog,
-    query_text: str,
-) -> list[LiveEvidenceDocument]:
-    query_tokens = _tokenize(query_text)
-    listing_responses = await asyncio.gather(
-        *[
-            client.get(url, headers=_build_request_headers(), follow_redirects=True)
-            for url in catalog.listing_urls
-        ],
+async def _run_tavily_queries(query_texts: list[str]) -> tuple[list[TavilySearchResponse], list[str]]:
+    responses: list[TavilySearchResponse] = []
+    errors: list[str] = []
+    results = await asyncio.gather(
+        *[search_with_tavily(query) for query in query_texts],
         return_exceptions=True,
     )
-
-    link_candidates: dict[str, LinkCandidate] = {}
-    for listing_url, result in zip(catalog.listing_urls, listing_responses, strict=False):
+    for result in results:
         if isinstance(result, Exception):
-            logger.warning("trusted_listing_fetch_failed url=%s error=%s", listing_url, result)
+            logger.exception("tavily_query_failed", exc_info=result)
+            errors.append(str(result))
             continue
-        if result.status_code >= 400:
-            continue
-        for candidate in _extract_same_domain_links(
-            result.text,
-            listing_url=listing_url,
-            catalog=catalog,
-            query_tokens=query_tokens,
-        ):
-            existing = link_candidates.get(candidate.url)
-            if existing is None or candidate.score > existing.score:
-                link_candidates[candidate.url] = candidate
-
-    ordered_candidates = sorted(
-        link_candidates.values(),
-        key=lambda item: (item.score, len(item.anchor_text)),
-        reverse=True,
-    )[: settings.live_evidence_max_listing_links_per_catalog]
-
-    documents = await asyncio.gather(
-        *[
-            _fetch_document(
-                client,
-                candidate.url,
-                catalog=catalog,
-                base_metadata={
-                    "seeded_by": "live_trusted_lookup",
-                    "source_channel": "trusted_catalog",
-                    "match_score": round(candidate.score, 4),
-                    "anchor_text": candidate.anchor_text,
-                },
-            )
-            for candidate in ordered_candidates
-        ],
-        return_exceptions=True,
-    )
-
-    ranked: list[tuple[float, LiveEvidenceDocument]] = []
-    for result in documents:
-        if isinstance(result, Exception) or result is None:
-            continue
-        score = _token_overlap_score(query_tokens, f"{result.title} {result.snippet} {result.text_content[:800]}")
-        if score <= 0:
-            continue
-        ranked.append((score, result))
-
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return [document for _, document in ranked[: settings.live_evidence_max_documents_per_catalog]]
-
-
-async def _documents_from_google_matches(
-    client: httpx.AsyncClient,
-    *,
-    matches: list[GoogleFactCheckMatch],
-) -> list[LiveEvidenceDocument]:
-    documents = await asyncio.gather(
-        *[
-            _fetch_document(
-                client,
-                match.review_url,
-                catalog=get_catalog_for_url(match.review_url),
-                base_metadata={
-                    "seeded_by": "live_trusted_lookup",
-                    "source_channel": "google_fact_check_api",
-                    "matched_claim": match.claim_text,
-                    "matched_language_code": match.language_code,
-                    "publisher_site": match.publisher_site,
-                    "review_title": match.review_title,
-                    "textual_rating": match.textual_rating,
-                    "review_date": match.review_date,
-                    "site_filter": match.matched_by_site_filter,
-                },
-            )
-            for match in matches
-            if is_trusted_url(match.review_url)
-        ],
-        return_exceptions=True,
-    )
-    return [document for document in documents if isinstance(document, LiveEvidenceDocument)]
-
-
-async def _documents_from_search_results(
-    client: httpx.AsyncClient,
-    *,
-    results: list[SearchResult],
-) -> list[LiveEvidenceDocument]:
-    documents = await asyncio.gather(
-        *[
-            _fetch_document(
-                client,
-                result.url,
-                catalog=get_catalog_for_url(result.url),
-                base_metadata={
-                    "seeded_by": "live_trusted_lookup",
-                    "source_channel": "general_search_api",
-                    "search_provider": result.provider,
-                    "search_title": result.title,
-                    "search_snippet": result.snippet,
-                },
-            )
-            for result in results
-            if is_trusted_url(result.url)
-        ],
-        return_exceptions=True,
-    )
-    return [document for document in documents if isinstance(document, LiveEvidenceDocument)]
+        responses.append(result)
+    return responses, errors
 
 
 async def hydrate_live_evidence(
@@ -426,78 +241,106 @@ async def hydrate_live_evidence(
             "updated_count": 0,
             "channels": [],
             "search_queries": [],
-            "google_match_count": 0,
-            "general_search_result_count": 0,
+            "search_answer_context": None,
+            "tavily_request_count": 0,
             "normalized_hash": normalized_hash,
             "documents": [],
         }
-    channels = ["google_fact_check_api"]
-    if settings.general_search_enabled:
-        channels.append("general_search_api")
-    channels.append("trusted_catalog")
+
+    tavily_responses, errors = await _run_tavily_queries(query_texts)
+    normalized_results = dedupe_search_results(
+        [
+            result
+            for response in tavily_responses
+            for result in normalize_tavily_response(response)
+        ]
+    )
+    normalized_results = normalized_results[: settings.live_evidence_max_documents]
+
+    request_ids = [
+        response.request_id
+        for response in tavily_responses
+        if response.request_id
+    ]
+    search_answers = [
+        clean_text(response.answer or "")
+        for response in tavily_responses
+        if clean_text(response.answer or "")
+    ]
+    search_answer_context = "\n".join(search_answers) or None
+
+    search_run = SearchRun(
+        extracted_claim=claim_text,
+        search_queries=query_texts,
+        provider="tavily",
+        search_answer=search_answer_context,
+        request_ids=request_ids,
+        result_count=len(normalized_results),
+        crawled_count=sum(1 for result in normalized_results if result.selected_for_crawl),
+        status="failed" if errors and not tavily_responses else "completed",
+        error_message="; ".join(errors)[:2000] if errors else None,
+    )
+    session.add(search_run)
+    await session.flush()
 
     timeout = min(settings.live_evidence_timeout_seconds, settings.request_timeout_seconds)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        google_match_results = await asyncio.gather(
-            *[search_google_fact_checks(query, language=language) for query in query_texts],
-            return_exceptions=True,
-        )
-        google_matches_by_url: dict[str, GoogleFactCheckMatch] = {}
-        for result in google_match_results:
-            if isinstance(result, Exception):
-                logger.warning("google_fact_check_query_failed error=%s", result)
-                continue
-            for match in result:
-                google_matches_by_url.setdefault(match.review_url, match)
-        google_matches = list(google_matches_by_url.values())
-        google_documents = await _documents_from_google_matches(client, matches=google_matches)
-
-        general_search_results_by_url: dict[str, SearchResult] = {}
-        if settings.general_search_enabled:
-            general_search_results_nested = await asyncio.gather(
-                *[search_general_web(query, language=language) for query in query_texts],
-                return_exceptions=True,
-            )
-            for result in general_search_results_nested:
-                if isinstance(result, Exception):
-                    logger.warning("general_search_query_failed error=%s", result)
-                    continue
-                for item in result:
-                    general_search_results_by_url.setdefault(item.url, item)
-        general_search_results = list(general_search_results_by_url.values())
-        general_documents = await _documents_from_search_results(client, results=general_search_results)
-
-        catalog_documents_nested = await asyncio.gather(
+        document_results = await asyncio.gather(
             *[
-                _discover_catalog_documents(client, catalog=catalog, query_text=query_texts[0])
-                for catalog in _catalogs_for_language(language)
+                _document_from_search_result(
+                    client,
+                    result,
+                    search_answer=search_answer_context,
+                    search_run_id=str(search_run.id),
+                )
+                for result in normalized_results
             ],
             return_exceptions=True,
         )
 
-    catalog_documents: list[LiveEvidenceDocument] = []
-    for result in catalog_documents_nested:
+    documents: list[LiveEvidenceDocument] = []
+    for index, result in enumerate(normalized_results, start=1):
+        session.add(
+            SearchResultRecord(
+                search_run_id=search_run.id,
+                query=result.query,
+                title=result.title[:255],
+                url=result.url,
+                snippet=result.snippet,
+                content=result.content,
+                provider=result.provider,
+                search_score=result.search_score,
+                trust_score=result.trust_score,
+                favicon=result.favicon,
+                rank=index,
+                selected_for_crawl=result.selected_for_crawl,
+            )
+        )
+
+    for result in document_results:
         if isinstance(result, Exception):
-            logger.warning("trusted_catalog_discovery_failed error=%s", result)
+            logger.warning("tavily_document_build_failed error=%s", result)
             continue
-        catalog_documents.extend(result)
+        if result is not None:
+            documents.append(result)
 
-    deduped_documents: dict[str, LiveEvidenceDocument] = {}
-    for document in [*google_documents, *general_documents, *catalog_documents]:
-        deduped_documents.setdefault(document.url, document)
-
-    selected_documents = list(deduped_documents.values())[: settings.live_evidence_max_documents]
+    search_run.crawled_count = sum(1 for result in normalized_results if result.selected_for_crawl)
+    selected_documents = documents[: settings.live_evidence_max_documents]
     if not selected_documents:
+        await session.commit()
         return {
             "enabled": True,
             "attempted": True,
             "ingested_count": 0,
             "created_count": 0,
             "updated_count": 0,
-            "channels": channels,
+            "channels": ["tavily"],
             "search_queries": query_texts,
-            "google_match_count": len(google_matches),
-            "general_search_result_count": len(general_search_results),
+            "search_answer_context": search_answer_context,
+            "tavily_request_count": len(tavily_responses),
+            "tavily_result_count": len(normalized_results),
+            "crawled_count": search_run.crawled_count,
+            "search_run_id": str(search_run.id),
             "normalized_hash": normalized_hash,
             "documents": [],
         }
@@ -522,10 +365,13 @@ async def hydrate_live_evidence(
         "ingested_count": len(items),
         "created_count": created_count,
         "updated_count": updated_count,
-        "channels": channels,
+        "channels": ["tavily"],
         "search_queries": query_texts,
-        "google_match_count": len(google_matches),
-        "general_search_result_count": len(general_search_results),
+        "search_answer_context": search_answer_context,
+        "tavily_request_count": len(tavily_responses),
+        "tavily_result_count": len(normalized_results),
+        "crawled_count": search_run.crawled_count,
+        "search_run_id": str(search_run.id),
         "normalized_hash": normalized_hash,
         "documents": [
             {
