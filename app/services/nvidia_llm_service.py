@@ -23,7 +23,8 @@ from app.schemas.verdict_schema import (
 from app.services.ai_model_router import NVIDIAModelTask, get_model_for_task, is_task_enabled
 from app.services.cache_service import cache_service
 from app.services.evidence_context_builder import build_evidence_context
-from app.services.language_service import detect_language
+from app.services.gemini_client import call_gemini_generate_content
+from app.services.language_service import detect_language, has_bangla_script, has_hindi_script
 from app.services.nvidia_client import call_nvidia_chat
 from app.services.text_cleaning_service import clean_text
 from app.utils.json_repair import load_json_with_repair
@@ -32,7 +33,7 @@ logger = get_logger(__name__)
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
-CLAIM_EXTRACTION_SYSTEM_PROMPT = """
+BASE_CLAIM_EXTRACTION_SYSTEM_PROMPT = """
 You are JachAI's claim extraction model.
 
 Your only job is to normalize messy user input into a structured claim for downstream retrieval.
@@ -44,8 +45,6 @@ Important rules:
 - Remove greetings, hashtags, calls to action, and repeated noise.
 - Keep the extracted claim faithful to the user's meaning.
 - If the input already contains a clean single claim, copy that claim nearly verbatim.
-- If the claim is written in Banglish or Hinglish using Latin script, keep that original wording in Latin script unless you are only removing obvious wrapper text.
-- Do not translate Romanized Bangla or Romanized Hindi into English during extraction.
 - Do not paraphrase, strengthen, weaken, translate, or "improve" the claim wording unless needed to remove obvious wrapper noise.
 - Preserve named entities, numbers, dates, locations, negations, modality, and legal or medical wording exactly when present.
 - Do not replace key terms with synonyms if that could change the meaning.
@@ -80,6 +79,33 @@ Return JSON exactly in this schema:
     {"claim": "string", "priority": 1}
   ]
 }
+""".strip()
+
+NVIDIA_CLAIM_EXTRACTION_SYSTEM_PROMPT = BASE_CLAIM_EXTRACTION_SYSTEM_PROMPT
+
+GEMINI_CLAIM_EXTRACTION_SYSTEM_PROMPT = (
+    BASE_CLAIM_EXTRACTION_SYSTEM_PROMPT
+    + "\n\nGemini-specific rules:\n"
+    + "- If the input already contains a clean single claim, keep the factual meaning unchanged.\n"
+    + "- For Banglish written in Latin script, convert the extracted claim into natural Bangla script.\n"
+    + "- For Hinglish written in Latin script, convert the extracted claim into natural Hindi script.\n"
+    + "- If the input is already in Bangla, Hindi, or English, keep the extracted claim in that same native script/language unless you are only removing obvious wrapper noise.\n"
+    + "- Translate script, not meaning. Do not invent a different interpretation of ambiguous words.\n"
+    + "- If a Romanized word is ambiguous, transliterate it phonetically into the native script instead of guessing a different word.\n"
+    + "- Do not paraphrase, strengthen, weaken, summarize, or verify the claim.\n"
+).strip()
+
+IMAGE_OCR_EXTRACTION_SUFFIX = """
+
+This input came from OCR on an image or screenshot.
+
+Additional OCR rules:
+- The OCR text may contain usernames, profile names, timestamps, app labels, buttons, menus, channel names, logos, watermarks, captions, comments, ticker text, or unrelated background words.
+- Ignore those background/interface words unless they are necessary to understand the claim.
+- Select the single most prominent factual claim the user is likely asking to verify.
+- Prefer a headline, overlaid statement, poster text, or caption-like claim over UI chrome or metadata.
+- If multiple text blocks appear, keep only the one or two lines that form the core factual claim.
+- Do not return a dump of all detected text.
 """.strip()
 
 SEARCH_QUERY_SYSTEM_PROMPT = """
@@ -172,15 +198,20 @@ Return JSON exactly in this schema:
 """.strip()
 
 VISION_SYSTEM_PROMPT = """
-You are a careful OCR fallback assistant.
-Extract only the readable factual text from the provided image.
+You are JachAI's OCR assistant for image-based fact checking.
+Extract only the text most likely to be the factual claim the user wants verified.
 Return strict JSON only with key: extracted_text.
 
 Rules:
-- Preserve the claim meaning while fixing obvious OCR formatting noise.
+- Preserve the original wording and script of the claim text. Do not translate.
+- Prefer the main headline, overlaid statement, post body, or caption that contains the factual claim.
+- Ignore background or interface text such as usernames, profile handles, timestamps, menus, buttons, logos, watermarks, follower counts, ads, navigation, comment counts, and unrelated ticker text unless essential to the claim.
+- If there are multiple text blocks, keep only the one to three lines that contain the central factual claim.
+- Return those claim lines in reading order separated by newline characters.
 - Do not summarize, explain, or fact-check.
 - Do not invent missing text.
-- If the image text is unreadable, return the longest clearly readable text segment you can recover.
+- Do not return a dump of every visible word in the image.
+- If no clear factual claim is visible, return the clearest readable claim-like text segment you can recover.
 """.strip()
 
 ALLOWED_VERDICTS = {"Likely True", "Likely False", "Misleading", "Not Enough Evidence"}
@@ -193,6 +224,39 @@ _CLAIM_STOPWORDS = {
     "for", "from", "has", "have", "in", "into", "is", "it",
     "its", "of", "on", "or", "that", "the", "this", "to",
     "was", "were", "with",
+}
+CLAIM_EXTRACTION_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "extracted_claim": {"type": "string"},
+        "detected_language": {"type": "string"},
+        "category": {"type": "string"},
+        "entities": {"type": "array", "items": {"type": "string"}},
+        "time_context": {"type": "string"},
+        "location_context": {"type": "string"},
+        "requires_freshness": {"type": "boolean"},
+        "verification_strategy": {"type": "string"},
+        "detected_claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "claim": {"type": "string"},
+                    "priority": {"type": "integer"},
+                },
+                "required": ["claim", "priority"],
+            },
+        },
+    },
+    "required": [
+        "extracted_claim",
+        "detected_language",
+        "category",
+        "entities",
+        "requires_freshness",
+        "verification_strategy",
+        "detected_claims",
+    ],
 }
 
 
@@ -230,6 +294,78 @@ def _call_with_retry(call_fn, *, retries: int = 1):
     pass
 
 
+def _native_language_for_romanized(language: str) -> str | None:
+    if language == "Banglish":
+        return "Bangla"
+    if language == "Hinglish":
+        return "Hindi"
+    return None
+
+
+def _normalize_claim_source_kind(source_kind: str | None) -> str:
+    normalized_source_kind = clean_text(str(source_kind or "")).lower()
+    return "image_ocr" if normalized_source_kind == "image_ocr" else "text"
+
+
+def _claim_extraction_system_prompt(provider: str, source_kind: str = "text") -> str:
+    base_prompt = (
+        GEMINI_CLAIM_EXTRACTION_SYSTEM_PROMPT
+        if provider == "gemini"
+        else NVIDIA_CLAIM_EXTRACTION_SYSTEM_PROMPT
+    )
+    if _normalize_claim_source_kind(source_kind) == "image_ocr":
+        return f"{base_prompt}\n\n{IMAGE_OCR_EXTRACTION_SUFFIX}"
+    return base_prompt
+
+
+def _claim_extraction_cache_task(provider: str, model: str | None, source_kind: str = "text") -> str:
+    normalized_source_kind = _normalize_claim_source_kind(source_kind)
+    return f"{NVIDIAModelTask.CLAIM_EXTRACTION.value}:{provider}:{model}:{normalized_source_kind}"
+
+
+def _build_claim_extraction_user_prompt(
+    claim_text: str,
+    language_hint: str,
+    *,
+    source_kind: str = "text",
+) -> str:
+    normalized_source_kind = _normalize_claim_source_kind(source_kind)
+    return (
+        f"Input source:\n{normalized_source_kind}\n\n"
+        f"Raw user input:\n{claim_text}\n\n"
+        f"Language hint:\n{language_hint}\n"
+    )
+
+
+async def _request_claim_extraction_content(
+    *,
+    provider: str,
+    model: str | None,
+    user_prompt: str,
+    source_kind: str = "text",
+) -> str:
+    system_prompt = _claim_extraction_system_prompt(provider, source_kind)
+    if provider == "gemini":
+        return await call_gemini_generate_content(
+            system_instruction=system_prompt,
+            user_content=user_prompt,
+            model=model,
+            response_mime_type="application/json",
+            response_schema=CLAIM_EXTRACTION_RESPONSE_SCHEMA,
+            max_output_tokens=800,
+        )
+
+    return await _call_llm_with_retry(
+        task=NVIDIAModelTask.CLAIM_EXTRACTION,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.0,
+        max_tokens=800,
+    )
+
+
 def _claim_tokens(text: str) -> set[str]:
     return {
         token
@@ -256,6 +392,7 @@ def _should_preserve_original_claim_text(
     extracted_claim: str,
     *,
     language_hint: str,
+    provider: str,
 ) -> bool:
     """
     Prefer the user's original wording when the model appears to have paraphrased
@@ -271,6 +408,11 @@ def _should_preserve_original_claim_text(
         return False
 
     original_language = clean_text(language_hint) or detect_language(original)
+    native_language = _native_language_for_romanized(original_language)
+    if provider == "gemini" and native_language == "Bangla":
+        return not has_bangla_script(extracted)
+    if provider == "gemini" and native_language == "Hindi":
+        return not has_hindi_script(extracted)
     if original_language in {"Banglish", "Hinglish"}:
         return extracted.lower() not in original.lower()
 
@@ -284,11 +426,32 @@ def _should_preserve_original_claim_text(
     return overlap >= 0.5 and token_drift
 
 
+def _normalize_detected_extraction_language(
+    *,
+    extracted_claim: str,
+    detected_language: str,
+    language_hint: str,
+    provider: str,
+) -> str:
+    normalized_language = clean_text(detected_language or language_hint or "Unknown")
+    if provider != "gemini":
+        return normalized_language
+
+    hinted_language = clean_text(language_hint) or detect_language(extracted_claim)
+    native_language = _native_language_for_romanized(hinted_language)
+    if native_language == "Bangla" and has_bangla_script(extracted_claim):
+        return "Bangla"
+    if native_language == "Hindi" and has_hindi_script(extracted_claim):
+        return "Hindi"
+    return normalized_language
+
+
 def _normalize_extraction_payload(
     payload: dict[str, Any],
     *,
     claim_text: str,
     language_hint: str,
+    provider: str,
 ) -> dict[str, Any]:
     normalized = dict(payload)
     extracted_claim = clean_text(str(normalized.get("extracted_claim") or claim_text))
@@ -296,11 +459,17 @@ def _normalize_extraction_payload(
         claim_text,
         extracted_claim,
         language_hint=language_hint,
+        provider=provider,
     ):
         extracted_claim = clean_text(claim_text)
         logger.info("claim_extraction_preserved_original_wording")
     normalized["extracted_claim"] = extracted_claim
-    normalized["detected_language"] = clean_text(str(normalized.get("detected_language") or language_hint or "Unknown"))
+    normalized["detected_language"] = _normalize_detected_extraction_language(
+        extracted_claim=extracted_claim,
+        detected_language=str(normalized.get("detected_language") or ""),
+        language_hint=language_hint,
+        provider=provider,
+    )
     normalized["category"] = clean_text(str(normalized.get("category") or "Other")) or "Other"
     # New fields with safe defaults
     entities = normalized.get("entities")
@@ -465,58 +634,92 @@ async def extract_claim_context(
     language_hint: str,
     *,
     cache_key: str | None = None,
+    source_kind: str = "text",
 ) -> tuple[ClaimExtractionSchema, dict[str, Any]]:
-    model = get_model_for_task(NVIDIAModelTask.CLAIM_EXTRACTION)
-    if not settings.nvidia_api_key:
-        return fallback_claim_extraction(claim_text, language_hint=language_hint), {"model": model, "call_count": 0}
-    if not model:
-        return fallback_claim_extraction(claim_text, language_hint=language_hint), {"model": None, "call_count": 0}
+    use_gemini = settings.gemini_claim_extraction_enabled is True
+    provider = "gemini" if use_gemini else "nvidia"
+    normalized_source_kind = _normalize_claim_source_kind(source_kind)
+    model = (
+        settings.active_gemini_claim_extraction_model
+        if use_gemini
+        else get_model_for_task(NVIDIAModelTask.CLAIM_EXTRACTION)
+    )
+    if use_gemini and not model:
+        return fallback_claim_extraction(claim_text, language_hint=language_hint), {
+            "model": None,
+            "provider": provider,
+            "source_kind": normalized_source_kind,
+            "call_count": 0,
+        }
+    if not use_gemini and not settings.nvidia_api_key:
+        return fallback_claim_extraction(claim_text, language_hint=language_hint), {
+            "model": model,
+            "provider": provider,
+            "source_kind": normalized_source_kind,
+            "call_count": 0,
+        }
+    if not use_gemini and not model:
+        return fallback_claim_extraction(claim_text, language_hint=language_hint), {
+            "model": None,
+            "provider": provider,
+            "source_kind": normalized_source_kind,
+            "call_count": 0,
+        }
 
-    cache_task = f"{NVIDIAModelTask.CLAIM_EXTRACTION.value}:{model}"
+    cache_task = _claim_extraction_cache_task(provider, model, normalized_source_kind)
     if cache_key:
         cached_payload = await cache_service.get_ai_task_payload(cache_task, cache_key)
         if cached_payload:
             try:
                 return ClaimExtractionSchema.model_validate(cached_payload), {
                     "model": model,
+                    "provider": provider,
+                    "source_kind": normalized_source_kind,
                     "call_count": 0,
                     "cached": True,
                 }
             except Exception:
                 logger.warning("cached_claim_extraction_invalid cache_key=%s", cache_key)
 
-    user_prompt = (
-        f"Raw user input:\n{claim_text}\n\n"
-        f"Language hint:\n{language_hint}\n"
+    user_prompt = _build_claim_extraction_user_prompt(
+        claim_text,
+        language_hint,
+        source_kind=normalized_source_kind,
     )
 
     attempted_call = False
     try:
         attempted_call = True
-        content = await _call_llm_with_retry(
-            task=NVIDIAModelTask.CLAIM_EXTRACTION,
-            messages=[
-                {"role": "system", "content": CLAIM_EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.0,
-            max_tokens=800,
+        content = await _request_claim_extraction_content(
+            provider=provider,
+            model=model,
+            user_prompt=user_prompt,
+            source_kind=normalized_source_kind,
         )
         payload = load_json_with_repair(content or "{}")
         normalized = _normalize_extraction_payload(
             payload,
             claim_text=claim_text,
             language_hint=language_hint,
+            provider=provider,
         )
         extraction = ClaimExtractionSchema.model_validate(normalized)
         if cache_key:
             await cache_service.set_ai_task_payload(cache_task, cache_key, extraction.model_dump(mode="json"))
-        return extraction, {"model": model, "call_count": 1, "cached": False}
+        return extraction, {
+            "model": model,
+            "provider": provider,
+            "source_kind": normalized_source_kind,
+            "call_count": 1,
+            "cached": False,
+        }
     except Exception:
-        logger.exception("nvidia_claim_extraction_failed")
+        logger.exception("%s_claim_extraction_failed", provider)
 
     return fallback_claim_extraction(claim_text, language_hint=language_hint), {
         "model": model,
+        "provider": provider,
+        "source_kind": normalized_source_kind,
         "call_count": 1 if attempted_call else 0,
         "cached": False,
     }
@@ -844,12 +1047,12 @@ async def generate_verdict(
     ), {"model": model, "call_count": 1 if attempted_call else 0}
 
 
-async def extract_text_with_vision_fallback(
+async def extract_text_with_kimi_ocr(
     image_bytes: bytes,
     *,
     mime_type: str | None = None,
 ) -> str | None:
-    if not is_task_enabled(NVIDIAModelTask.IMAGE_OCR_FALLBACK):
+    if not is_task_enabled(NVIDIAModelTask.IMAGE_OCR):
         return None
 
     content_type = mime_type if mime_type and mime_type.startswith("image/") else "image/png"
@@ -862,8 +1065,9 @@ async def extract_text_with_vision_fallback(
                 {
                     "type": "text",
                     "text": (
-                        "Extract the text from this screenshot and return strict JSON only "
-                        "with the key extracted_text."
+                        "Extract only the main factual-claim text from this image. "
+                        "If more than one line is needed, keep the claim lines separated "
+                        "with newline characters in extracted_text. Return strict JSON only."
                     ),
                 },
                 {
@@ -876,7 +1080,7 @@ async def extract_text_with_vision_fallback(
 
     try:
         content = await call_nvidia_chat(
-            task=NVIDIAModelTask.IMAGE_OCR_FALLBACK,
+            task=NVIDIAModelTask.IMAGE_OCR,
             messages=messages,
             temperature=0.0,
             response_format={"type": "json_object"},
@@ -884,10 +1088,14 @@ async def extract_text_with_vision_fallback(
         )
         payload = load_json_with_repair(content or "{}")
         result = VisionOCRSchema.model_validate(payload)
-        extracted_text = clean_text(result.extracted_text)
-        if len(extracted_text) < settings.ocr_min_characters:
+        extracted_text = "\n".join(
+            clean_text(line)
+            for line in str(result.extracted_text).splitlines()
+            if clean_text(line)
+        )
+        if len(clean_text(extracted_text)) < settings.ocr_min_characters:
             return None
         return extracted_text
     except Exception:
-        logger.exception("nvidia_vision_fallback_failed")
+        logger.exception("kimi_ocr_failed")
         return None

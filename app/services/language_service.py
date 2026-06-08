@@ -61,10 +61,22 @@ def _marker_score(tokens: list[str], markers: set[str]) -> int:
     return sum(1 for token in tokens if token in markers)
 
 
+def has_bangla_script(value: str) -> bool:
+    return bool(BANGLA_RE.search(value))
+
+
+def has_hindi_script(value: str) -> bool:
+    return bool(HINDI_RE.search(value))
+
+
+def has_latin_script(value: str) -> bool:
+    return bool(LATIN_RE.search(value))
+
+
 def detect_language(value: str) -> str:
-    has_bangla = bool(BANGLA_RE.search(value))
-    has_hindi = bool(HINDI_RE.search(value))
-    has_latin = bool(LATIN_RE.search(value))
+    has_bangla = has_bangla_script(value)
+    has_hindi = has_hindi_script(value)
+    has_latin = has_latin_script(value)
 
     if has_bangla and has_latin and not has_hindi:
         return "Banglish"

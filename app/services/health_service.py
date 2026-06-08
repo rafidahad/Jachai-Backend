@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import shutil
-
 from app.core.config import settings
 from app.core.database import check_database_connection
 from app.core.redis import ping_redis
@@ -28,14 +26,13 @@ async def get_system_health() -> HealthResponseSchema:
         and settings.nvidia_base_url
         and settings.active_nvidia_rerank_model
     )
-    vision_enabled = settings.nvidia_enable_vision_fallback
-    vision_ok = bool(
+    kimi_ocr_enabled = settings.nvidia_enable_vision_fallback
+    kimi_ocr_ok = bool(
         settings.nvidia_vision_enabled
         and settings.nvidia_api_key
         and settings.nvidia_base_url
         and settings.active_nvidia_vision_model
     )
-    tesseract_ok = shutil.which("tesseract") is not None
     evidence_index_ok = False
     evidence_index_message = "Evidence index could not be checked."
 
@@ -89,22 +86,16 @@ async def get_system_health() -> HealthResponseSchema:
             ),
         ),
         ComponentHealthSchema(
-            name="nvidia_vision",
-            status="healthy" if (not vision_enabled or vision_ok) else "degraded",
-            ok=(not vision_enabled or vision_ok),
+            name="kimi_ocr",
+            status="healthy" if (not kimi_ocr_enabled or kimi_ocr_ok) else "degraded",
+            ok=(not kimi_ocr_enabled or kimi_ocr_ok),
             message=(
-                "NVIDIA vision fallback is configured."
-                if vision_ok
-                else "NVIDIA vision fallback is disabled."
-                if not vision_enabled
-                else "NVIDIA vision fallback is enabled but not configured."
+                "Kimi OCR is configured."
+                if kimi_ocr_ok
+                else "Kimi OCR is disabled."
+                if not kimi_ocr_enabled
+                else "Kimi OCR is enabled but not configured."
             ),
-        ),
-        ComponentHealthSchema(
-            name="tesseract",
-            status="healthy" if tesseract_ok else "degraded",
-            ok=tesseract_ok,
-            message="Tesseract is available." if tesseract_ok else "Tesseract is not installed.",
         ),
         ComponentHealthSchema(
             name="evidence_index",

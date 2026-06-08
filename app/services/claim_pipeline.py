@@ -37,7 +37,7 @@ from app.services.nvidia_llm_service import (
     generate_verdict,
 )
 from app.services.nvidia_rerank_service import rerank_evidence
-from app.services.ocr_service import extract_text_from_image_with_fallback
+from app.services.ocr_service import extract_text_from_image, prepare_ocr_text_for_claim_extraction
 from app.services.pii_service import mask_pii
 from app.services.retrieval_service import retrieve_evidence
 from app.services.search_service import score_source_credibility
@@ -831,6 +831,7 @@ async def _pipeline_from_text(
             masked_text,
             language,
             cache_key=hash_value,
+            source_kind="image_ocr" if input_type == "image" else "text",
         )
         retrieval_query = extraction.extracted_claim or masked_text
         logger.info(
@@ -1024,11 +1025,7 @@ async def _pipeline_from_text(
             query_metadata.get("model") or get_model_for_task(NVIDIAModelTask.SEARCH_QUERY_GENERATION)
         )
         rerank_model = rerank_metadata.get("model")
-        vision_model = (
-            str(claim_context.get("nvidia_vision_model"))
-            if claim_context.get("nvidia_vision_model")
-            else None
-        )
+        vision_model = str(claim_context.get("ocr_model")) if claim_context.get("ocr_model") else None
         ai_usage = _build_ai_usage_payload(
             claim_extraction_model=claim_extraction_model,
             query_generation_model=query_generation_model,
@@ -1046,7 +1043,7 @@ async def _pipeline_from_text(
                 int(rerank_metadata.get("call_count", 0))
                 + int(chunk_rerank_metadata.get("call_count", 0))
             ),
-            vision_call_count=1 if claim_context.get("ocr_method") == "nvidia_vision_fallback" else 0,
+            vision_call_count=1 if claim_context.get("ocr_method") == "kimi_ocr" else 0,
             tavily_request_count=int(live_evidence.get("tavily_request_count", 0)),
         )
 
@@ -1284,18 +1281,22 @@ async def process_image_claim(
             message=f"Image must be {settings.max_image_size_mb} MB or smaller.",
         )
 
-    text, ocr_method = await extract_text_from_image_with_fallback(image_bytes, mime_type=content_type)
-    metadata: dict[str, Any] = {"ocr_method": ocr_method}
+    ocr_text = await extract_text_from_image(image_bytes, mime_type=content_type)
+    text = prepare_ocr_text_for_claim_extraction(ocr_text)
+    if len(clean_text(text)) < 5:
+        text = clean_text(ocr_text)
+    metadata: dict[str, Any] = {"ocr_method": "kimi_ocr"}
     if filename:
         metadata["filename"] = filename
     if external_id:
         metadata["external_id"] = external_id
-    if ocr_method == "nvidia_vision_fallback":
-        vision_model = get_model_for_task(NVIDIAModelTask.IMAGE_OCR_FALLBACK)
-        if vision_model:
-            metadata["nvidia_vision_model"] = vision_model
+    vision_model = get_model_for_task(NVIDIAModelTask.IMAGE_OCR)
+    if vision_model:
+        metadata["ocr_model"] = vision_model
     # OCR text may be noisy — add warning in context
     metadata["ocr_warning"] = "Input extracted via OCR — text may contain noise or errors."
+    metadata["ocr_line_count"] = len([line for line in ocr_text.splitlines() if clean_text(line)])
+    metadata["ocr_text_compacted"] = text != clean_text(ocr_text)
     return await _pipeline_from_text(
         session,
         input_type="image",

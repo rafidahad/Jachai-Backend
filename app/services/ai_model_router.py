@@ -16,7 +16,7 @@ class NVIDIAModelTask(str, Enum):
     SEARCH_QUERY_GENERATION = "search_query_generation"
     CLAIM_REASONING = "claim_reasoning"
     EVIDENCE_RERANKING = "evidence_reranking"
-    IMAGE_OCR_FALLBACK = "image_ocr_fallback"
+    IMAGE_OCR = "image_ocr"
 
 
 def get_model_for_task(task: NVIDIAModelTask) -> str | None:
@@ -29,7 +29,7 @@ def get_model_for_task(task: NVIDIAModelTask) -> str | None:
     if task == NVIDIAModelTask.EVIDENCE_RERANKING:
         model = settings.active_nvidia_rerank_model
         return RERANK_MODEL_ALIASES.get(model or "", model)
-    if task == NVIDIAModelTask.IMAGE_OCR_FALLBACK:
+    if task == NVIDIAModelTask.IMAGE_OCR:
         return settings.active_nvidia_vision_model if settings.nvidia_vision_enabled else None
     return None
 

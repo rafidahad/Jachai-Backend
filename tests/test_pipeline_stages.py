@@ -110,6 +110,22 @@ class TestInputNormalization:
 # ── 2. Claim extraction ───────────────────────────────────────────────────────
 
 class TestClaimExtraction:
+    def test_image_ocr_claim_prompt_adds_noise_filtering_rules(self):
+        from app.services.nvidia_llm_service import _claim_extraction_system_prompt
+
+        prompt = _claim_extraction_system_prompt("gemini", "image_ocr")
+
+        assert "This input came from OCR on an image or screenshot." in prompt
+        assert "Do not return a dump of all detected text." in prompt
+
+    def test_claim_extraction_cache_task_separates_text_and_image_ocr(self):
+        from app.services.nvidia_llm_service import _claim_extraction_cache_task
+
+        text_task = _claim_extraction_cache_task("gemini", "gemini-3.1-flash-lite", "text")
+        image_task = _claim_extraction_cache_task("gemini", "gemini-3.1-flash-lite", "image_ocr")
+
+        assert text_task != image_task
+
     def test_fallback_claim_extraction_returns_schema(self):
         from app.services.nvidia_llm_service import fallback_claim_extraction
         result = fallback_claim_extraction("WHO says vaccines cause autism", language_hint="English")
@@ -136,6 +152,7 @@ class TestClaimExtraction:
             payload,
             claim_text="Ramisa's murderer received the death penalty.",
             language_hint="English",
+            provider="nvidia",
         )
 
         assert normalized["extracted_claim"] == "Ramisa's murderer received the death penalty."
@@ -152,25 +169,28 @@ class TestClaimExtraction:
             payload,
             claim_text="Please verify this claim: Ramisa's murderer received the death penalty.",
             language_hint="English",
+            provider="nvidia",
         )
 
         assert normalized["extracted_claim"] == "Ramisa's murderer received the death penalty."
 
-    def test_normalize_extraction_preserves_romanized_bangla_when_llm_rewrites_meaning(self):
+    def test_normalize_extraction_accepts_native_script_translation_for_gemini_banglish(self):
         from app.services.nvidia_llm_service import _normalize_extraction_payload
 
         payload = {
-            "extracted_claim": "Donald Trump's name is in a Dhaka jail",
-            "detected_language": "English",
+            "extracted_claim": "ডোনাল্ড ট্রাম্প নামের মহিষ এখন ঢাকার চিড়িয়াখানায়।",
+            "detected_language": "Banglish",
             "category": "Other",
         }
         normalized = _normalize_extraction_payload(
             payload,
             claim_text="Donald trump namer mohish ekhon chiriakhanae dhakar.",
             language_hint="Banglish",
+            provider="gemini",
         )
 
-        assert normalized["extracted_claim"] == "Donald trump namer mohish ekhon chiriakhanae dhakar."
+        assert normalized["extracted_claim"] == "ডোনাল্ড ট্রাম্প নামের মহিষ এখন ঢাকার চিড়িয়াখানায়।"
+        assert normalized["detected_language"] == "Bangla"
 
     def test_claim_extraction_schema_has_new_fields(self):
         from app.schemas.verdict_schema import ClaimExtractionSchema
@@ -192,11 +212,80 @@ class TestClaimExtraction:
     async def test_extract_claim_context_uses_fallback_without_api_key(self):
         from app.services.nvidia_llm_service import extract_claim_context
         with patch("app.services.nvidia_llm_service.settings") as mock_settings:
+            mock_settings.gemini_claim_extraction_enabled = False
             mock_settings.nvidia_api_key = ""
             mock_settings.llm_json_retry_count = 1
             result, meta = await extract_claim_context("Some claim", "English")
             assert result.extracted_claim == "Some claim"
             assert meta["call_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_extract_claim_context_prefers_gemini_when_configured(self):
+        from app.services.nvidia_llm_service import extract_claim_context
+
+        gemini_payload = json.dumps({
+            "extracted_claim": "Some claim",
+            "detected_language": "English",
+            "category": "Other",
+            "entities": [],
+            "time_context": "",
+            "location_context": "",
+            "requires_freshness": False,
+            "verification_strategy": "general_web",
+            "detected_claims": [{"claim": "Some claim", "priority": 1}],
+        })
+
+        with patch("app.services.nvidia_llm_service.settings") as mock_settings:
+            mock_settings.gemini_claim_extraction_enabled = True
+            mock_settings.active_gemini_claim_extraction_model = "gemini-3.1-flash-lite"
+            mock_settings.llm_json_retry_count = 1
+            with patch(
+                "app.services.nvidia_llm_service.call_gemini_generate_content",
+                new_callable=AsyncMock,
+                return_value=gemini_payload,
+            ) as mock_gemini:
+                result, meta = await extract_claim_context("Some claim", "English")
+
+        assert result.extracted_claim == "Some claim"
+        assert meta["provider"] == "gemini"
+        assert meta["model"] == "gemini-3.1-flash-lite"
+        mock_gemini.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_extract_claim_context_uses_image_ocr_prompt_for_image_inputs(self):
+        from app.services.nvidia_llm_service import extract_claim_context
+
+        gemini_payload = json.dumps({
+            "extracted_claim": "Ramisa's murderer received the death penalty.",
+            "detected_language": "English",
+            "category": "Crime",
+            "entities": ["Ramisa"],
+            "time_context": "",
+            "location_context": "",
+            "requires_freshness": True,
+            "verification_strategy": "news_source_first",
+            "detected_claims": [{"claim": "Ramisa's murderer received the death penalty.", "priority": 1}],
+        })
+
+        with patch("app.services.nvidia_llm_service.settings") as mock_settings:
+            mock_settings.gemini_claim_extraction_enabled = True
+            mock_settings.active_gemini_claim_extraction_model = "gemini-3.1-flash-lite"
+            mock_settings.llm_json_retry_count = 1
+            with patch(
+                "app.services.nvidia_llm_service.call_gemini_generate_content",
+                new_callable=AsyncMock,
+                return_value=gemini_payload,
+            ) as mock_gemini:
+                result, meta = await extract_claim_context(
+                    "Follow\n2h\nRamisa's murderer received the death penalty.\nLike Reply Share",
+                    "English",
+                    source_kind="image_ocr",
+                )
+
+        assert result.extracted_claim == "Ramisa's murderer received the death penalty."
+        assert meta["source_kind"] == "image_ocr"
+        assert "OCR on an image or screenshot" in mock_gemini.await_args.kwargs["system_instruction"]
+        assert "Input source:\nimage_ocr" in mock_gemini.await_args.kwargs["user_content"]
 
 
 # ── 3. Query generation ───────────────────────────────────────────────────────
@@ -284,7 +373,60 @@ class TestEvidenceFetching:
         assert doc is None or doc.fetch_status == "snippet_fallback"
 
 
-# ── 6. Evidence cleaning & chunking ──────────────────────────────────────────
+# ── 6. OCR ───────────────────────────────────────────────────────────────────
+
+class TestOcr:
+    def test_prepare_ocr_text_for_claim_extraction_filters_ui_noise(self):
+        from app.services.ocr_service import prepare_ocr_text_for_claim_extraction
+
+        text = "\n".join([
+            "DailyStarNews",
+            "Follow",
+            "2h",
+            "Ramisa's murderer received the death penalty.",
+            "Like Reply Share",
+        ])
+
+        assert prepare_ocr_text_for_claim_extraction(text) == "Ramisa's murderer received the death penalty."
+
+    def test_prepare_ocr_text_for_claim_extraction_trims_single_line_ui_noise(self):
+        from app.services.ocr_service import prepare_ocr_text_for_claim_extraction
+
+        text = "Follow 2h Ramisa's murderer received the death penalty. Like Reply Share"
+
+        assert prepare_ocr_text_for_claim_extraction(text) == "Ramisa's murderer received the death penalty."
+
+    @pytest.mark.asyncio
+    async def test_image_ocr_uses_kimi_model(self):
+        from app.services.ocr_service import extract_text_from_image
+
+        with patch(
+            "app.services.ocr_service.extract_text_with_kimi_ocr",
+            new_callable=AsyncMock,
+            return_value="This screenshot contains enough extracted text to pass OCR validation.",
+        ) as mock_ocr:
+            text = await extract_text_from_image(b"fake-image-bytes", mime_type="image/png")
+
+        assert "enough extracted text" in text
+        mock_ocr.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_image_ocr_rejects_too_short_output(self):
+        from app.services.ocr_service import extract_text_from_image
+        from app.utils.errors import AppError
+
+        with patch(
+            "app.services.ocr_service.extract_text_with_kimi_ocr",
+            new_callable=AsyncMock,
+            return_value="tiny",
+        ):
+            with pytest.raises(AppError) as exc:
+                await extract_text_from_image(b"fake-image-bytes", mime_type="image/png")
+
+        assert exc.value.code == "OCR_FAILED"
+
+
+# ── 7. Evidence cleaning & chunking ──────────────────────────────────────────
 
 class TestEvidenceChunking:
     def test_chunk_preserves_source_metadata(self):

@@ -29,6 +29,19 @@ class Settings(BaseSettings):
     database_url: str = Field(validation_alias=AliasChoices("DATABASE_URL"))
     database_sync_url: str = Field(validation_alias=AliasChoices("DATABASE_SYNC_URL"))
     redis_url: str = Field(validation_alias=AliasChoices("REDIS_URL"))
+    gemini_api_key: str | None = Field(default=None, validation_alias=AliasChoices("GEMINI_API_KEY"))
+    gemini_base_url: str = Field(
+        default="https://generativelanguage.googleapis.com/v1beta",
+        validation_alias=AliasChoices("GEMINI_BASE_URL"),
+    )
+    gemini_claim_extraction_model: str | None = Field(
+        default="gemini-3.1-flash-lite",
+        validation_alias=AliasChoices("GEMINI_CLAIM_EXTRACTION_MODEL"),
+    )
+    gemini_timeout_seconds: float = Field(
+        default=60.0,
+        validation_alias=AliasChoices("GEMINI_TIMEOUT_SECONDS"),
+    )
     nvidia_api_key: str = Field(validation_alias=AliasChoices("NVIDIA_API_KEY"))
     nvidia_base_url: str = Field(validation_alias=AliasChoices("NVIDIA_BASE_URL"))
     nvidia_llm_model: str | None = Field(default=None, validation_alias=AliasChoices("NVIDIA_LLM_MODEL"))
@@ -52,10 +65,13 @@ class Settings(BaseSettings):
         default="https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking",
         validation_alias=AliasChoices("NVIDIA_RERANK_URL", "NVIDIA_RERANK_ENDPOINT"),
     )
-    nvidia_vision_model: str | None = Field(default=None, validation_alias=AliasChoices("NVIDIA_VISION_MODEL"))
+    nvidia_vision_model: str | None = Field(
+        default="moonshotai/kimi-k2.6",
+        validation_alias=AliasChoices("NVIDIA_VISION_MODEL", "KIMI_OCR_MODEL"),
+    )
     nvidia_enable_vision_fallback: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("NVIDIA_ENABLE_VISION_FALLBACK", "ENABLE_VISION_FALLBACK"),
+        default=True,
+        validation_alias=AliasChoices("NVIDIA_ENABLE_VISION_FALLBACK", "ENABLE_VISION_FALLBACK", "KIMI_OCR_ENABLED"),
     )
     nvidia_rpm_safety_limit: int = Field(default=30, validation_alias=AliasChoices("NVIDIA_MAX_RPM"))
     nvidia_max_uncached_claims_per_minute: int = Field(
@@ -91,9 +107,7 @@ class Settings(BaseSettings):
     final_evidence_top_k: int = Field(default=10, validation_alias=AliasChoices("FINAL_EVIDENCE_TOP_K"))
     rerank_min_candidates: int = Field(default=6, validation_alias=AliasChoices("RERANK_MIN_CANDIDATES"))
     min_relevant_similarity: float = Field(default=0.60, validation_alias=AliasChoices("MIN_RELEVANT_SIMILARITY"))
-    ocr_engine: str = Field(default="tesseract", validation_alias=AliasChoices("OCR_ENGINE"))
     ocr_min_characters: int = Field(default=10, validation_alias=AliasChoices("OCR_MIN_CHARACTERS"))
-    ocr_languages: str = Field(default="eng+ben+hin", validation_alias=AliasChoices("OCR_LANGUAGES"))
     max_image_size_mb: int = Field(default=8, validation_alias=AliasChoices("MAX_IMAGE_SIZE_MB"))
     request_timeout_seconds: float = 15.0
     search_provider: str = Field(default="tavily", validation_alias=AliasChoices("SEARCH_PROVIDER"))
@@ -273,6 +287,17 @@ class Settings(BaseSettings):
     @property
     def active_nvidia_reasoning_model(self) -> str | None:
         return self.nvidia_reasoning_model or self.nvidia_llm_model
+
+    @property
+    def active_gemini_claim_extraction_model(self) -> str | None:
+        if not self.gemini_claim_extraction_model:
+            return None
+        normalized = self.gemini_claim_extraction_model.strip()
+        return normalized or None
+
+    @property
+    def gemini_claim_extraction_enabled(self) -> bool:
+        return bool(self.gemini_api_key and self.active_gemini_claim_extraction_model)
 
     @property
     def active_nvidia_claim_extraction_model(self) -> str | None:
