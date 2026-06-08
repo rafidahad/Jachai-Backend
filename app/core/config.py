@@ -154,7 +154,7 @@ class Settings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("ENABLE_DEBUG_OUTPUT"),
     )
-    trusted_domains: list[str] = Field(
+    trusted_domains: Annotated[list[str], NoDecode] = Field(
         default_factory=list,
         validation_alias=AliasChoices("TRUSTED_DOMAINS"),
     )
@@ -214,6 +214,36 @@ class Settings(BaseSettings):
             normalized = "postgresql://" + normalized[len("postgres://") :]
         if normalized.startswith("postgresql+asyncpg://"):
             normalized = normalized.replace("postgresql+asyncpg://", "postgresql://", 1)
+        return normalized
+
+    @field_validator("search_provider", "tavily_search_depth", "tavily_topic", mode="before")
+    @classmethod
+    def parse_search_settings(cls, value: object, info) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise TypeError(f"Invalid {info.field_name} value")
+
+        normalized = value.strip().lower()
+
+        if info.field_name == "search_provider":
+            if normalized in {"tavily"}:
+                return normalized
+            raise TypeError("Invalid SEARCH_PROVIDER value")
+
+        if info.field_name == "tavily_search_depth":
+            aliases = {
+                "advance": "advanced",
+                "advanced": "advanced",
+                "basic": "basic",
+            }
+            if normalized in aliases:
+                return aliases[normalized]
+            raise TypeError("Invalid TAVILY_SEARCH_DEPTH value")
+
+        if info.field_name == "tavily_topic":
+            if normalized in {"general", "news"}:
+                return normalized
+            raise TypeError("Invalid TAVILY_TOPIC value")
+
         return normalized
 
     @field_validator(
