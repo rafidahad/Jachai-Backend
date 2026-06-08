@@ -98,6 +98,10 @@ class TestInputNormalization:
         from app.services.language_service import detect_language
         assert detect_language("ami ajke meeting e jabo না") == "Banglish"
 
+    def test_detect_language_handles_romanized_bangla_without_native_script(self):
+        from app.services.language_service import detect_language
+        assert detect_language("Donald trump namer mohish ekhon chiriakhanae dhakar.") == "Banglish"
+
     def test_normalized_hash_is_whitespace_insensitive(self):
         from app.utils.hashing import normalized_hash
         assert normalized_hash("Fact check me") == normalized_hash("  fact   check me  ")
@@ -151,6 +155,22 @@ class TestClaimExtraction:
         )
 
         assert normalized["extracted_claim"] == "Ramisa's murderer received the death penalty."
+
+    def test_normalize_extraction_preserves_romanized_bangla_when_llm_rewrites_meaning(self):
+        from app.services.nvidia_llm_service import _normalize_extraction_payload
+
+        payload = {
+            "extracted_claim": "Donald Trump's name is in a Dhaka jail",
+            "detected_language": "English",
+            "category": "Other",
+        }
+        normalized = _normalize_extraction_payload(
+            payload,
+            claim_text="Donald trump namer mohish ekhon chiriakhanae dhakar.",
+            language_hint="Banglish",
+        )
+
+        assert normalized["extracted_claim"] == "Donald trump namer mohish ekhon chiriakhanae dhakar."
 
     def test_claim_extraction_schema_has_new_fields(self):
         from app.schemas.verdict_schema import ClaimExtractionSchema

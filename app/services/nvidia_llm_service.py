@@ -23,6 +23,7 @@ from app.schemas.verdict_schema import (
 from app.services.ai_model_router import NVIDIAModelTask, get_model_for_task, is_task_enabled
 from app.services.cache_service import cache_service
 from app.services.evidence_context_builder import build_evidence_context
+from app.services.language_service import detect_language
 from app.services.nvidia_client import call_nvidia_chat
 from app.services.text_cleaning_service import clean_text
 from app.utils.json_repair import load_json_with_repair
@@ -43,6 +44,8 @@ Important rules:
 - Remove greetings, hashtags, calls to action, and repeated noise.
 - Keep the extracted claim faithful to the user's meaning.
 - If the input already contains a clean single claim, copy that claim nearly verbatim.
+- If the claim is written in Banglish or Hinglish using Latin script, keep that original wording in Latin script unless you are only removing obvious wrapper text.
+- Do not translate Romanized Bangla or Romanized Hindi into English during extraction.
 - Do not paraphrase, strengthen, weaken, translate, or "improve" the claim wording unless needed to remove obvious wrapper noise.
 - Preserve named entities, numbers, dates, locations, negations, modality, and legal or medical wording exactly when present.
 - Do not replace key terms with synonyms if that could change the meaning.
@@ -248,7 +251,12 @@ def _looks_like_concise_claim(text: str) -> bool:
     return sentence_like_breaks <= 1
 
 
-def _should_preserve_original_claim_text(original_text: str, extracted_claim: str) -> bool:
+def _should_preserve_original_claim_text(
+    original_text: str,
+    extracted_claim: str,
+    *,
+    language_hint: str,
+) -> bool:
     """
     Prefer the user's original wording when the model appears to have paraphrased
     an already concise claim rather than simply removing wrapper noise.
@@ -261,6 +269,10 @@ def _should_preserve_original_claim_text(original_text: str, extracted_claim: st
         return False
     if not _looks_like_concise_claim(original):
         return False
+
+    original_language = clean_text(language_hint) or detect_language(original)
+    if original_language in {"Banglish", "Hinglish"}:
+        return extracted.lower() not in original.lower()
 
     original_tokens = _claim_tokens(original)
     extracted_tokens = _claim_tokens(extracted)
@@ -280,7 +292,11 @@ def _normalize_extraction_payload(
 ) -> dict[str, Any]:
     normalized = dict(payload)
     extracted_claim = clean_text(str(normalized.get("extracted_claim") or claim_text))
-    if _should_preserve_original_claim_text(claim_text, extracted_claim):
+    if _should_preserve_original_claim_text(
+        claim_text,
+        extracted_claim,
+        language_hint=language_hint,
+    ):
         extracted_claim = clean_text(claim_text)
         logger.info("claim_extraction_preserved_original_wording")
     normalized["extracted_claim"] = extracted_claim

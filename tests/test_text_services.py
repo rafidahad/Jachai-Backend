@@ -18,5 +18,9 @@ def test_detect_language_handles_banglish() -> None:
     assert detect_language("ami ajke meeting e jabo না") == "Banglish"
 
 
+def test_detect_language_handles_romanized_bangla_without_native_script() -> None:
+    assert detect_language("Donald trump namer mohish ekhon chiriakhanae dhakar.") == "Banglish"
+
+
 def test_normalized_hash_is_whitespace_insensitive() -> None:
     assert normalized_hash("Fact check me") == normalized_hash("  fact   check me  ")
