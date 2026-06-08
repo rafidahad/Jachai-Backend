@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 from typing import Any
 from uuid import UUID
 
@@ -41,6 +42,10 @@ Important rules:
 - Extract the single clearest factual claim that can be checked.
 - Remove greetings, hashtags, calls to action, and repeated noise.
 - Keep the extracted claim faithful to the user's meaning.
+- If the input already contains a clean single claim, copy that claim nearly verbatim.
+- Do not paraphrase, strengthen, weaken, translate, or "improve" the claim wording unless needed to remove obvious wrapper noise.
+- Preserve named entities, numbers, dates, locations, negations, modality, and legal or medical wording exactly when present.
+- Do not replace key terms with synonyms if that could change the meaning.
 - Do not verify, judge, or score the claim.
 - Do not mention evidence, verdicts, or confidence.
 - Do not use your internal knowledge to assess the claim.
@@ -179,6 +184,13 @@ ALLOWED_VERDICTS = {"Likely True", "Likely False", "Misleading", "Not Enough Evi
 ALLOWED_CONFIDENCE_LABELS = {"Low", "Medium", "High"}
 ALLOWED_STANCES = {"supports", "refutes", "neutral", "background"}
 ALLOWED_QUERY_PURPOSES = {"general", "official", "refutation", "recent", "background"}
+_CLAIM_TOKEN_PATTERN = re.compile(r"[\w']+", re.UNICODE)
+_CLAIM_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "by",
+    "for", "from", "has", "have", "in", "into", "is", "it",
+    "its", "of", "on", "or", "that", "the", "this", "to",
+    "was", "were", "with",
+}
 
 
 # ── Helper utilities ──────────────────────────────────────────────────────────
@@ -215,6 +227,51 @@ def _call_with_retry(call_fn, *, retries: int = 1):
     pass
 
 
+def _claim_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in _CLAIM_TOKEN_PATTERN.findall(text.lower())
+        if len(token) >= 3 and token not in _CLAIM_STOPWORDS
+    }
+
+
+def _looks_like_concise_claim(text: str) -> bool:
+    cleaned = clean_text(text)
+    if not cleaned:
+        return False
+    if len(cleaned) > 220 or len(cleaned.split()) > 32:
+        return False
+    lowered = cleaned.lower()
+    if "http://" in lowered or "https://" in lowered:
+        return False
+    sentence_like_breaks = lowered.count(". ") + lowered.count("? ") + lowered.count("! ")
+    return sentence_like_breaks <= 1
+
+
+def _should_preserve_original_claim_text(original_text: str, extracted_claim: str) -> bool:
+    """
+    Prefer the user's original wording when the model appears to have paraphrased
+    an already concise claim rather than simply removing wrapper noise.
+    """
+    original = clean_text(original_text)
+    extracted = clean_text(extracted_claim)
+    if not original or not extracted or original == extracted:
+        return False
+    if extracted.lower() in original.lower():
+        return False
+    if not _looks_like_concise_claim(original):
+        return False
+
+    original_tokens = _claim_tokens(original)
+    extracted_tokens = _claim_tokens(extracted)
+    if not original_tokens or not extracted_tokens:
+        return False
+
+    overlap = len(original_tokens & extracted_tokens) / max(1, min(len(original_tokens), len(extracted_tokens)))
+    token_drift = bool(original_tokens - extracted_tokens) or bool(extracted_tokens - original_tokens)
+    return overlap >= 0.5 and token_drift
+
+
 def _normalize_extraction_payload(
     payload: dict[str, Any],
     *,
@@ -222,7 +279,11 @@ def _normalize_extraction_payload(
     language_hint: str,
 ) -> dict[str, Any]:
     normalized = dict(payload)
-    normalized["extracted_claim"] = clean_text(str(normalized.get("extracted_claim") or claim_text))
+    extracted_claim = clean_text(str(normalized.get("extracted_claim") or claim_text))
+    if _should_preserve_original_claim_text(claim_text, extracted_claim):
+        extracted_claim = clean_text(claim_text)
+        logger.info("claim_extraction_preserved_original_wording")
+    normalized["extracted_claim"] = extracted_claim
     normalized["detected_language"] = clean_text(str(normalized.get("detected_language") or language_hint or "Unknown"))
     normalized["category"] = clean_text(str(normalized.get("category") or "Other")) or "Other"
     # New fields with safe defaults

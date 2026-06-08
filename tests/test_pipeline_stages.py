@@ -120,6 +120,38 @@ class TestClaimExtraction:
         result = fallback_claim_extraction("Bad JSON claim", language_hint="Unknown")
         assert result.extracted_claim == "Bad JSON claim"
 
+    def test_normalize_extraction_preserves_original_wording_for_clean_claims(self):
+        from app.services.nvidia_llm_service import _normalize_extraction_payload
+
+        payload = {
+            "extracted_claim": "Ramisa's murderer was sentenced to death.",
+            "detected_language": "English",
+            "category": "Crime",
+        }
+        normalized = _normalize_extraction_payload(
+            payload,
+            claim_text="Ramisa's murderer received the death penalty.",
+            language_hint="English",
+        )
+
+        assert normalized["extracted_claim"] == "Ramisa's murderer received the death penalty."
+
+    def test_normalize_extraction_keeps_cleaned_claim_when_wrapper_text_is_removed(self):
+        from app.services.nvidia_llm_service import _normalize_extraction_payload
+
+        payload = {
+            "extracted_claim": "Ramisa's murderer received the death penalty.",
+            "detected_language": "English",
+            "category": "Crime",
+        }
+        normalized = _normalize_extraction_payload(
+            payload,
+            claim_text="Please verify this claim: Ramisa's murderer received the death penalty.",
+            language_hint="English",
+        )
+
+        assert normalized["extracted_claim"] == "Ramisa's murderer received the death penalty."
+
     def test_claim_extraction_schema_has_new_fields(self):
         from app.schemas.verdict_schema import ClaimExtractionSchema
         schema = ClaimExtractionSchema(
