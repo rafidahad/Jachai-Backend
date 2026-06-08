@@ -183,6 +183,53 @@ def _looks_like_unsupported_detail(explanation: str, user_response: str) -> bool
     return any(marker in text for marker in markers)
 
 
+def _is_poor_verdict_summary(summary: str, *, claim_text: str) -> bool:
+    normalized = clean_text(summary)
+    if not normalized:
+        return True
+    lowered = normalized.lower()
+    claim_lowered = clean_text(claim_text).lower()
+    if lowered.startswith(("claim to verify:", "claim:", "input claim:", "extracted claim:")):
+        return True
+    if lowered in {claim_lowered, f"claim to verify: {claim_lowered}"}:
+        return True
+    if len(normalized) < 45 and claim_lowered and claim_lowered in lowered:
+        return True
+    return False
+
+
+def _build_claim_aware_summary(
+    *,
+    verdict_label: str,
+    claim_text: str,
+    explanation: str,
+    evidence: list[dict[str, Any]],
+) -> str:
+    claim = clean_text(claim_text)
+    source_count = len(evidence)
+    source_phrase = f"{source_count} source{'s' if source_count != 1 else ''}" if source_count else "the available sources"
+    compact_explanation = clean_text(explanation)
+
+    if verdict_label == "Likely True":
+        lead = f"JachAI found reliable evidence supporting the claim: \"{claim}\"."
+    elif verdict_label == "Likely False":
+        lead = f"JachAI found reliable evidence contradicting the claim: \"{claim}\"."
+    elif verdict_label == "Misleading":
+        lead = f"JachAI found that the claim \"{claim}\" is misleading or missing important context."
+    else:
+        lead = f"JachAI could not verify the claim \"{claim}\" from reliable matching evidence."
+
+    if compact_explanation and not _is_poor_verdict_summary(compact_explanation, claim_text=claim):
+        return f"{lead} {compact_explanation}"
+
+    if verdict_label == "Not Enough Evidence":
+        return (
+            f"{lead} {source_phrase.capitalize()} did not directly confirm the claim, "
+            "so the result remains Not Enough Evidence."
+        )
+    return f"{lead} The verdict is based on the strongest matching evidence JachAI retrieved."
+
+
 def _source_ids_from_evidence(evidence: list[dict[str, Any]], *, limit: int = 3) -> list[UUID]:
     source_ids: list[UUID] = []
     for item in evidence:
@@ -439,6 +486,14 @@ def _apply_verdict_guardrails(
     if not confidence_label:
         confidence_label = _confidence_label_from_score(confidence)
 
+    if _is_poor_verdict_summary(user_response, claim_text=extracted_claim):
+        user_response = _build_claim_aware_summary(
+            verdict_label=verdict_label,
+            claim_text=extracted_claim,
+            explanation=explanation,
+            evidence=relevant_evidence or evidence,
+        )
+
     return verdict.model_copy(
         update={
             "extracted_claim": extracted_claim,
@@ -529,6 +584,25 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
         for link in sorted(claim.evidence_links, key=lambda item: item.rank)
         if link.source is not None
     ]
+    extracted_claim = str(context_payload.get("extracted_claim") or claim.cleaned_text)
+    user_response = str(context_payload.get("user_response") or claim.share_summary)
+    if _is_poor_verdict_summary(user_response, claim_text=extracted_claim):
+        user_response = _build_claim_aware_summary(
+            verdict_label=claim.verdict,
+            claim_text=extracted_claim,
+            explanation=claim.explanation,
+            evidence=[
+                {
+                    "source_id": str(link.source.id),
+                    "trust_score": evidence_metadata.get(str(link.source.id), {}).get("trust_score"),
+                    "match_score": evidence_metadata.get(str(link.source.id), {}).get("match_score"),
+                    "similarity_score": evidence_metadata.get(str(link.source.id), {}).get("similarity_score"),
+                }
+                for link in claim.evidence_links
+                if link.source is not None
+            ],
+        )
+
     return ClaimResponseSchema(
         id=claim.id,
         cluster_id=claim.cluster_id,
@@ -539,7 +613,7 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
         masked_text=claim.masked_text,
         normalized_hash=claim.normalized_hash,
         language=claim.language,
-        extracted_claim=str(context_payload.get("extracted_claim") or claim.cleaned_text),
+        extracted_claim=extracted_claim,
         detected_language=str(context_payload.get("detected_language") or claim.language),
         category=str(context_payload.get("category") or "Other"),
         review_status=claim.review_status,
@@ -549,7 +623,7 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
             context_payload.get("confidence_label") or _confidence_label_from_score(claim.confidence)
         ),
         explanation=claim.explanation,
-        user_response=str(context_payload.get("user_response") or claim.share_summary),
+        user_response=user_response,
         reasoning=claim.reasoning,
         share_summary=claim.share_summary,
         created_at=claim.created_at,

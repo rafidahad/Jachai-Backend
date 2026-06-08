@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     claim_rate_limit_per_minute: int = 20
     internal_rate_limit_per_minute: int = 60
     pgvector_top_k: int = Field(default=20, validation_alias=AliasChoices("PGVECTOR_TOP_K"))
-    final_evidence_top_k: int = Field(default=5, validation_alias=AliasChoices("FINAL_EVIDENCE_TOP_K"))
+    final_evidence_top_k: int = Field(default=10, validation_alias=AliasChoices("FINAL_EVIDENCE_TOP_K"))
     rerank_min_candidates: int = Field(default=6, validation_alias=AliasChoices("RERANK_MIN_CANDIDATES"))
     min_relevant_similarity: float = Field(default=0.60, validation_alias=AliasChoices("MIN_RELEVANT_SIMILARITY"))
     ocr_engine: str = Field(default="tesseract", validation_alias=AliasChoices("OCR_ENGINE"))
@@ -106,7 +106,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("TAVILY_INCLUDE_RAW_CONTENT"),
     )
     tavily_include_images: bool = Field(default=False, validation_alias=AliasChoices("TAVILY_INCLUDE_IMAGES"))
-    tavily_max_results: int = Field(default=5, validation_alias=AliasChoices("TAVILY_MAX_RESULTS"))
+    tavily_max_results: int = Field(default=10, validation_alias=AliasChoices("TAVILY_MAX_RESULTS"))
     general_search_api_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices("GENERAL_SEARCH_API_KEY"),
@@ -143,11 +143,11 @@ class Settings(BaseSettings):
 
     # ── Evidence pipeline new config ──────────────────────────────────────────
     max_sources_to_fetch: int = Field(
-        default=5,
+        default=10,
         validation_alias=AliasChoices("MAX_SOURCES_TO_FETCH"),
     )
     max_evidence_chunks: int = Field(
-        default=12,
+        default=20,
         validation_alias=AliasChoices("MAX_EVIDENCE_CHUNKS"),
     )
     enable_debug_output: bool = Field(

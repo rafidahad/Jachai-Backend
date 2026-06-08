@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import re
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -29,6 +30,13 @@ DROP_QUERY_KEYS = {
     "utm_medium",
     "utm_source",
     "utm_term",
+}
+_SEARCH_TOKEN_PATTERN = re.compile(r"[\w']+", re.UNICODE)
+_SEARCH_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "been", "by",
+    "for", "from", "has", "have", "in", "into", "is", "it",
+    "its", "of", "on", "or", "that", "the", "this", "to",
+    "was", "were", "with",
 }
 
 # ── Default trusted domain registry ──────────────────────────────────────────
@@ -160,6 +168,73 @@ def _get_trusted_domain_entry(domain: str | None) -> tuple[float, str] | None:
 def trust_score_for_domain(domain: str | None) -> float:
     entry = _get_trusted_domain_entry(domain)
     return entry[0] if entry else 0.50
+
+
+def _search_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in _SEARCH_TOKEN_PATTERN.findall(text.lower())
+        if len(token) >= 3 and token not in _SEARCH_STOPWORDS
+    }
+
+
+def _search_overlap_score(claim_tokens: set[str], result: NormalizedSearchResult) -> float:
+    if not claim_tokens:
+        return 0.0
+    haystack = " ".join(
+        [
+            result.title,
+            result.snippet or "",
+            result.content or "",
+            result.query,
+        ]
+    )
+    result_tokens = _search_tokens(haystack)
+    if not result_tokens:
+        return 0.0
+    return min(1.0, len(claim_tokens & result_tokens) / len(claim_tokens))
+
+
+def _normalized_result_search_score(result: NormalizedSearchResult) -> float:
+    try:
+        score = float(result.search_score or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if score <= 1:
+        return max(0.0, min(1.0, score))
+    return max(0.0, min(1.0, score / 100.0))
+
+
+def select_reliable_matching_results(
+    results: list[NormalizedSearchResult],
+    *,
+    claim_text: str,
+    limit: int,
+) -> list[NormalizedSearchResult]:
+    """
+    Prefer results that both match the claim text and come from trusted domains.
+
+    If strict matching/trust would leave too few sources, this gracefully falls
+    back to the best remaining Tavily results instead of returning an empty set.
+    """
+    claim_tokens = _search_tokens(clean_text(claim_text))
+    scored: list[tuple[float, float, float, NormalizedSearchResult]] = []
+    for result in results:
+        overlap = _search_overlap_score(claim_tokens, result)
+        search_score = _normalized_result_search_score(result)
+        trust_score = max(0.0, min(1.0, float(result.trust_score or 0.5)))
+        full_content_bonus = 0.05 if result.content and len(result.content) >= MIN_TAVILY_CONTENT_CHARACTERS else 0.0
+        composite = (overlap * 0.45) + (trust_score * 0.35) + (search_score * 0.20) + full_content_bonus
+        scored.append((composite, overlap, trust_score, result))
+
+    enough_reliable_matches = [
+        item
+        for item in scored
+        if item[1] >= 0.15 and item[2] >= 0.60
+    ]
+    pool = enough_reliable_matches if len(enough_reliable_matches) >= max(3, min(limit, 5)) else scored
+    pool.sort(key=lambda item: (item[0], item[2], item[1]), reverse=True)
+    return [item[3] for item in pool[:limit]]
 
 
 def score_source_credibility(
@@ -308,7 +383,7 @@ def dedupe_search_results(results: list[NormalizedSearchResult]) -> list[Normali
 
     ordered = sorted(
         deduped.values(),
-        key=lambda item: ((item.search_score or 0.0), item.trust_score),
+        key=lambda item: (item.trust_score, _normalized_result_search_score(item)),
         reverse=True,
     )
     return ordered

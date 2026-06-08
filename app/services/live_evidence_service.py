@@ -23,6 +23,7 @@ from app.services.search_service import (
     normalize_search_url,
     normalize_tavily_response,
     search_with_tavily,
+    select_reliable_matching_results,
 )
 from app.services.source_service import ingest_sources
 from app.services.text_cleaning_service import clean_text
@@ -369,9 +370,12 @@ async def hydrate_live_evidence(
             for result in normalize_tavily_response(response)
         ]
     )
-    # Cap to max_sources_to_fetch
     cap = settings.max_sources_to_fetch
-    normalized_results = normalized_results[:cap]
+    normalized_results = select_reliable_matching_results(
+        normalized_results,
+        claim_text=claim_text,
+        limit=cap,
+    )
 
     request_ids = [response.request_id for response in tavily_responses if response.request_id]
     search_answers = [
