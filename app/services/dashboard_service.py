@@ -14,6 +14,18 @@ from app.schemas.dashboard_schema import (
     RecentClaimItemSchema,
     SummaryMetricSchema,
 )
+from app.schemas.verdict_schema import PIPELINE_TO_LEGACY_VERDICT, VerdictLabel
+
+_LEGACY_VERDICTS: frozenset[str] = frozenset(VerdictLabel.__args__)  # type: ignore[attr-defined]
+
+
+def _normalize_verdict(raw: str | None) -> VerdictLabel:
+    """Coerce any stored verdict value (legacy or pipeline) to a VerdictLabel."""
+    if raw in _LEGACY_VERDICTS:
+        return raw  # type: ignore[return-value]
+    if raw in PIPELINE_TO_LEGACY_VERDICT:
+        return PIPELINE_TO_LEGACY_VERDICT[raw]
+    return "Not Enough Evidence"
 
 
 async def get_summary_metrics(session: AsyncSession) -> SummaryMetricSchema:
@@ -82,7 +94,7 @@ async def get_recent_claims(session: AsyncSession, limit: int = 10) -> list[Rece
     return [
         RecentClaimItemSchema(
             id=str(claim.id),
-            verdict=claim.verdict,
+            verdict=_normalize_verdict(claim.verdict),
             language=claim.language,
             review_status=claim.review_status,
             created_at=claim.created_at,

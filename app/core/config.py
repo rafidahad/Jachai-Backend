@@ -154,7 +154,7 @@ class Settings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("ENABLE_DEBUG_OUTPUT"),
     )
-    trusted_domains: list[str] = Field(
+    trusted_domains: Annotated[list[str], NoDecode] = Field(
         default_factory=list,
         validation_alias=AliasChoices("TRUSTED_DOMAINS"),
     )

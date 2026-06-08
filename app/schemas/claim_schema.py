@@ -4,11 +4,24 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import Field, HttpUrl, StrictBool, StrictInt, StrictStr
+from pydantic import Field, HttpUrl, StrictBool, StrictInt, StrictStr, field_validator
 
 from app.schemas.ai_schema import AIUsageSchema
 from app.schemas.common import StrictBaseModel
-from app.schemas.verdict_schema import ConfidenceLabel, EvidenceSnippetSchema, LanguageLabel, VerdictLabel
+from app.schemas.verdict_schema import PIPELINE_TO_LEGACY_VERDICT, ConfidenceLabel, EvidenceSnippetSchema, LanguageLabel, VerdictLabel
+
+_LEGACY_VERDICTS: frozenset[str] = frozenset(VerdictLabel.__args__)  # type: ignore[attr-defined]
+
+
+def _coerce_verdict(v: object) -> object:
+    """Normalize old pipeline verdict labels to legacy VerdictLabel values."""
+    if isinstance(v, str):
+        if v in _LEGACY_VERDICTS:
+            return v
+        if v in PIPELINE_TO_LEGACY_VERDICT:
+            return PIPELINE_TO_LEGACY_VERDICT[v]
+        return "Not Enough Evidence"
+    return v
 
 InputType = Literal["text", "image", "url"]
 ReviewStatus = Literal["pending", "reviewed", "flagged"]
@@ -56,6 +69,11 @@ class ClaimResponseSchema(StrictBaseModel):
     ai_usage: AIUsageSchema | None = None
     context_payload: dict[str, object] = Field(default_factory=dict)
 
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def normalize_verdict(cls, v: object) -> object:
+        return _coerce_verdict(v)
+
 
 class VerificationJobSchema(StrictBaseModel):
     id: UUID
@@ -89,6 +107,11 @@ class ClaimShareSummarySchema(StrictBaseModel):
     summary: StrictStr
     verdict: VerdictLabel
     language: LanguageLabel
+
+    @field_validator("verdict", mode="before")
+    @classmethod
+    def normalize_verdict(cls, v: object) -> object:
+        return _coerce_verdict(v)
 
 
 class ClaimLookupResponseSchema(StrictBaseModel):
