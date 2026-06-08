@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     debug: bool = Field(default=False, validation_alias=AliasChoices("DEBUG"))
     api_v1_prefix: str = Field(default="/api/v1", validation_alias=AliasChoices("API_V1_PREFIX"))
     verification_pipeline_version: str = Field(
-        default="tavily-live-evidence-v10",
+        default="evidence-pipeline-v11",
         validation_alias=AliasChoices("VERIFICATION_PIPELINE_VERSION"),
     )
     database_url: str = Field(validation_alias=AliasChoices("DATABASE_URL"))
@@ -141,7 +141,37 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("LIVE_EVIDENCE_MIN_ARTICLE_CHARACTERS"),
     )
 
-    @field_validator("backend_cors_origins", mode="before")
+    # ── Evidence pipeline new config ──────────────────────────────────────────
+    max_sources_to_fetch: int = Field(
+        default=5,
+        validation_alias=AliasChoices("MAX_SOURCES_TO_FETCH"),
+    )
+    max_evidence_chunks: int = Field(
+        default=12,
+        validation_alias=AliasChoices("MAX_EVIDENCE_CHUNKS"),
+    )
+    enable_debug_output: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ENABLE_DEBUG_OUTPUT"),
+    )
+    trusted_domains: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("TRUSTED_DOMAINS"),
+    )
+    fetch_timeout_seconds: float = Field(
+        default=10.0,
+        validation_alias=AliasChoices("FETCH_TIMEOUT_SECONDS"),
+    )
+    max_fetch_bytes: int = Field(
+        default=2_000_000,
+        validation_alias=AliasChoices("MAX_FETCH_BYTES"),
+    )
+    llm_json_retry_count: int = Field(
+        default=1,
+        validation_alias=AliasChoices("LLM_JSON_RETRY_COUNT"),
+    )
+
+    @field_validator("backend_cors_origins", "trusted_domains", mode="before")
     @classmethod
     def parse_cors_origins(cls, value: object) -> list[str]:
         if value is None or value == "":
@@ -154,7 +184,7 @@ class Settings(BaseSettings):
                 parsed = json.loads(value)
                 return [str(item).strip() for item in parsed if str(item).strip()]
             return [item.strip() for item in value.split(",") if item.strip()]
-        raise TypeError("Invalid BACKEND_CORS_ORIGINS value")
+        raise TypeError("Invalid list value")
 
     @field_validator("database_url", mode="before")
     @classmethod
@@ -193,6 +223,7 @@ class Settings(BaseSettings):
         "tavily_include_raw_content",
         "tavily_include_images",
         "live_evidence_enabled",
+        "enable_debug_output",
         mode="before",
     )
     @classmethod

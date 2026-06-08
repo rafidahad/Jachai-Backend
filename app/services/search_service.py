@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -29,27 +30,59 @@ DROP_QUERY_KEYS = {
     "utm_source",
     "utm_term",
 }
-TRUSTED_DOMAIN_SCORES = {
-    "gov.bd": 0.95,
-    "who.int": 0.95,
-    "reuters.com": 0.92,
-    "apnews.com": 0.92,
-    "bbc.com": 0.90,
-    "afp.com": 0.90,
-    "rumorscanner.com": 0.95,
-    "rumorscannerbd.com": 0.95,
-    "fact-watch.org": 0.95,
-    "boomlive.in": 0.92,
-    "altnews.in": 0.92,
-    "prothomalo.com": 0.85,
-    "thedailystar.net": 0.85,
-    "tbsnews.net": 0.82,
-    "bdnews24.com": 0.82,
-    "dhakatribune.com": 0.82,
-    "foxnews.com": 0.78,
-    "greenwichtime.com": 0.74,
-    "thesunchronicle.com": 0.70,
+
+# ── Default trusted domain registry ──────────────────────────────────────────
+# Extended via TRUSTED_DOMAINS env var. Entries are (domain, score, source_type).
+_DEFAULT_TRUSTED_DOMAIN_SCORES: dict[str, tuple[float, str]] = {
+    # Government / official
+    "gov.bd": (0.95, "government"),
+    "who.int": (0.95, "official"),
+    "cdc.gov": (0.95, "official"),
+    "nasa.gov": (0.95, "official"),
+    "un.org": (0.93, "official"),
+    "nih.gov": (0.93, "official"),
+    "fda.gov": (0.92, "official"),
+    # Reputable international news
+    "reuters.com": (0.92, "reputable_news"),
+    "apnews.com": (0.92, "reputable_news"),
+    "bbc.com": (0.90, "reputable_news"),
+    "afp.com": (0.90, "reputable_news"),
+    "theguardian.com": (0.88, "reputable_news"),
+    "nytimes.com": (0.87, "reputable_news"),
+    "washingtonpost.com": (0.87, "reputable_news"),
+    # Fact-check organisations
+    "rumorscanner.com": (0.95, "fact_check"),
+    "rumorscannerbd.com": (0.95, "fact_check"),
+    "fact-watch.org": (0.95, "fact_check"),
+    "boomlive.in": (0.92, "fact_check"),
+    "altnews.in": (0.92, "fact_check"),
+    "snopes.com": (0.90, "fact_check"),
+    "factcheck.org": (0.90, "fact_check"),
+    "fullfact.org": (0.90, "fact_check"),
+    "factcheck.afp.com": (0.92, "fact_check"),
+    "politifact.com": (0.88, "fact_check"),
+    # Regional reputable news
+    "prothomalo.com": (0.85, "reputable_news"),
+    "thedailystar.net": (0.85, "reputable_news"),
+    "tbsnews.net": (0.82, "reputable_news"),
+    "bdnews24.com": (0.82, "reputable_news"),
+    "dhakatribune.com": (0.82, "reputable_news"),
+    # Lower trust
+    "foxnews.com": (0.70, "reputable_news"),
+    "greenwichtime.com": (0.65, "unknown"),
+    "thesunchronicle.com": (0.60, "unknown"),
 }
+
+# ── Social / low-quality domain patterns ─────────────────────────────────────
+_SOCIAL_DOMAINS = {
+    "facebook.com", "twitter.com", "x.com", "instagram.com",
+    "tiktok.com", "youtube.com", "reddit.com", "linkedin.com",
+    "t.me", "telegram.org",
+}
+_LOW_QUALITY_PATTERNS = (
+    "blogspot.", "wordpress.com", "medium.com", "substack.com",
+    "wix.com", "weebly.com",
+)
 
 
 class TavilyResult(BaseModel):
@@ -59,6 +92,7 @@ class TavilyResult(BaseModel):
     score: float | None = None
     raw_content: str | None = None
     favicon: str | None = None
+    published_date: str | None = None
 
 
 class TavilySearchResponse(BaseModel):
@@ -84,6 +118,7 @@ class NormalizedSearchResult(BaseModel):
     trust_score: float = 0.50
     selected_for_crawl: bool = False
     query_list: list[str] = Field(default_factory=list)
+    published_date: str | None = None
 
 
 def normalize_search_url(url: str) -> str:
@@ -101,13 +136,131 @@ def domain_from_url(url: str) -> str | None:
     return hostname.lower().removeprefix("www.") if hostname else None
 
 
-def trust_score_for_domain(domain: str | None) -> float:
+def _get_trusted_domain_entry(domain: str | None) -> tuple[float, str] | None:
+    """Return (score, source_type) for a domain, checking settings overrides first."""
     if not domain:
-        return 0.50
-    for trusted_domain, score in TRUSTED_DOMAIN_SCORES.items():
+        return None
+
+    # Check settings-configured domains first (score 0.85 default for configured ones)
+    for trusted in settings.trusted_domains:
+        td = trusted.lower().strip()
+        if domain == td or domain.endswith(f".{td}"):
+            # Try to find it in default map for better score, else use 0.85
+            entry = _DEFAULT_TRUSTED_DOMAIN_SCORES.get(td)
+            return entry if entry else (0.85, "reputable_news")
+
+    # Check default map
+    for trusted_domain, entry in _DEFAULT_TRUSTED_DOMAIN_SCORES.items():
         if domain == trusted_domain or domain.endswith(f".{trusted_domain}"):
-            return score
-    return 0.50
+            return entry
+
+    return None
+
+
+def trust_score_for_domain(domain: str | None) -> float:
+    entry = _get_trusted_domain_entry(domain)
+    return entry[0] if entry else 0.50
+
+
+def score_source_credibility(
+    *,
+    source_id: str,
+    domain: str | None,
+    snippet_only: bool = False,
+    published_date: str | None = None,
+    requires_freshness: bool = False,
+) -> dict[str, Any]:
+    """
+    Compute a structured credibility assessment for a source.
+
+    Returns a dict compatible with SourceCredibilitySchema.
+    """
+    if not domain:
+        return {
+            "source_id": source_id,
+            "domain": domain or "unknown",
+            "source_type": "unknown",
+            "credibility_score": 0.30,
+            "credibility_reason": "No domain information available.",
+            "snippet_only": snippet_only,
+        }
+
+    # Social media
+    if domain in _SOCIAL_DOMAINS:
+        return {
+            "source_id": source_id,
+            "domain": domain,
+            "source_type": "social_media",
+            "credibility_score": 0.20,
+            "credibility_reason": "Social media platform — not a primary source.",
+            "snippet_only": snippet_only,
+        }
+
+    # Low-quality blog patterns
+    if any(pat in domain for pat in _LOW_QUALITY_PATTERNS):
+        return {
+            "source_id": source_id,
+            "domain": domain,
+            "source_type": "blog",
+            "credibility_score": 0.30,
+            "credibility_reason": "User-generated blog platform — treat with caution.",
+            "snippet_only": snippet_only,
+        }
+
+    # Trusted domain lookup
+    entry = _get_trusted_domain_entry(domain)
+    if entry:
+        score, source_type = entry
+        reason = f"Recognized {source_type.replace('_', ' ')} domain."
+        # Penalty for snippet-only content
+        if snippet_only:
+            score = max(0.20, score - 0.20)
+            reason += " Content is snippet-only — confidence reduced."
+        # Penalty for missing date on freshness-sensitive claims
+        if requires_freshness and not published_date:
+            score = max(0.20, score - 0.15)
+            reason += " No publication date found — freshness unverifiable."
+        return {
+            "source_id": source_id,
+            "domain": domain,
+            "source_type": source_type,
+            "credibility_score": round(score, 3),
+            "credibility_reason": reason,
+            "snippet_only": snippet_only,
+        }
+
+    # Unknown domain — check TLD hints
+    source_type = "unknown"
+    base_score = 0.45
+    if domain.endswith(".gov") or domain.endswith(".gov.bd"):
+        source_type = "government"
+        base_score = 0.88
+    elif domain.endswith(".edu") or domain.endswith(".ac.uk"):
+        source_type = "academic"
+        base_score = 0.80
+    elif domain.endswith(".org"):
+        source_type = "primary_source"
+        base_score = 0.60
+
+    if snippet_only:
+        base_score = max(0.20, base_score - 0.15)
+    if requires_freshness and not published_date:
+        base_score = max(0.20, base_score - 0.10)
+
+    reason_parts = [f"Unknown domain ({domain})."]
+    if source_type != "unknown":
+        reason_parts.append(f"TLD suggests {source_type.replace('_', ' ')}.")
+    if snippet_only:
+        reason_parts.append("Snippet-only content.")
+
+    return {
+        "source_id": source_id,
+        "domain": domain,
+        "source_type": source_type,
+        "credibility_score": round(base_score, 3),
+        "credibility_reason": " ".join(reason_parts),
+        "snippet_only": snippet_only,
+    }
 
 
 def normalize_tavily_response(response: TavilySearchResponse) -> list[NormalizedSearchResult]:
@@ -131,6 +284,7 @@ def normalize_tavily_response(response: TavilySearchResponse) -> list[Normalized
                 trust_score=trust_score_for_domain(domain),
                 selected_for_crawl=len(content) < MIN_TAVILY_CONTENT_CHARACTERS,
                 query_list=[response.query],
+                published_date=result.published_date,
             )
         )
     return normalized

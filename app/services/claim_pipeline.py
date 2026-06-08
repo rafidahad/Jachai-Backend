@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from typing import Any
 from uuid import UUID
 
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
+from app.core.logging import get_logger
 from app.models.audit_log import AuditLog
 from app.models.claim import Claim, ClaimEvidenceLink
 from app.models.verification_job import VerificationJob
@@ -24,49 +26,34 @@ from app.services.ai_model_router import NVIDIAModelTask, get_model_for_task
 from app.services.cache_service import cache_service
 from app.services.cluster_service import get_or_create_cluster
 from app.services.embedding_service import embed_text
+from app.services.evidence_chunker import chunk_evidence_documents
 from app.services.evidence_index_service import get_evidence_index_status
 from app.services.language_service import detect_language
 from app.services.live_evidence_service import hydrate_live_evidence
-from app.services.nvidia_llm_service import extract_claim_context, generate_search_queries, generate_verdict
+from app.services.nvidia_llm_service import (
+    classify_evidence_stances,
+    extract_claim_context,
+    generate_search_queries,
+    generate_verdict,
+)
 from app.services.nvidia_rerank_service import rerank_evidence
 from app.services.ocr_service import extract_text_from_image_with_fallback
 from app.services.pii_service import mask_pii
 from app.services.retrieval_service import retrieve_evidence
+from app.services.search_service import score_source_credibility
 from app.services.text_cleaning_service import clean_text, text_from_html
 from app.utils.errors import AppError
 from app.utils.hashing import normalized_hash
 from app.utils.time import utc_now
 
+logger = get_logger(__name__)
+
 TOKEN_PATTERN = re.compile(r"[\w']+", re.UNICODE)
 MATCH_STOPWORDS = {
-    "a",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "been",
-    "by",
-    "for",
-    "from",
-    "has",
-    "have",
-    "in",
-    "into",
-    "is",
-    "it",
-    "its",
-    "of",
-    "on",
-    "or",
-    "that",
-    "the",
-    "this",
-    "to",
-    "was",
-    "were",
-    "with",
+    "a", "an", "and", "are", "as", "at", "be", "been", "by",
+    "for", "from", "has", "have", "in", "into", "is", "it",
+    "its", "of", "on", "or", "that", "the", "this", "to",
+    "was", "were", "with",
 }
 MATCH_TOKEN_ALIASES = {
     "buffaloes": "buffalo",
@@ -92,6 +79,8 @@ MATCH_TOKEN_ALIASES = {
     "কুরবানি": "sacrifice",
 }
 
+
+# ── Utility helpers ───────────────────────────────────────────────────────────
 
 def _parse_uuid(value: UUID | str, *, code: str, message: str) -> UUID:
     if isinstance(value, UUID):
@@ -172,7 +161,7 @@ def _calculate_match_score(
 
 def _evidence_relevance_score(item: dict[str, Any]) -> float:
     scores: list[float] = []
-    for key in ("match_score", "similarity_score", "lexical_overlap_score"):
+    for key in ("match_score", "similarity_score", "lexical_overlap_score", "relevance_score"):
         try:
             scores.append(float(item.get(key) or 0.0))
         except (TypeError, ValueError):
@@ -187,15 +176,9 @@ def _is_relevant_evidence(item: dict[str, Any]) -> bool:
 def _looks_like_unsupported_detail(explanation: str, user_response: str) -> bool:
     text = f"{explanation} {user_response}".lower()
     markers = (
-        "does not mention",
-        "doesn't mention",
-        "do not mention",
-        "no mention",
-        "not mention",
-        "does not support",
-        "do not support",
-        "unsupported",
-        "but not",
+        "does not mention", "doesn't mention", "do not mention",
+        "no mention", "not mention", "does not support",
+        "do not support", "unsupported", "but not",
     )
     return any(marker in text for marker in markers)
 
@@ -230,16 +213,25 @@ def _build_reasoning_text(
     evidence: list[dict[str, Any]],
     *,
     rerank_applied: bool,
+    classified_chunks: list[dict[str, Any]] | None = None,
 ) -> str:
     relevant_count = sum(1 for item in evidence if _is_relevant_evidence(item))
+    chunk_info = f", {len(classified_chunks)} classified evidence chunks" if classified_chunks else ""
+    pipeline_verdict = getattr(verdict, "pipeline_verdict", None)
+    verdict_info = f" (pipeline verdict: {pipeline_verdict})" if pipeline_verdict else ""
     return (
-        f"Evaluated {len(evidence)} evidence source(s), used {len(verdict.used_source_ids)} source(s) in the final "
-        f"answer, {relevant_count} met the relevance threshold of {settings.min_relevant_similarity:.2f}, "
-        f"and reranking was {'applied' if rerank_applied else 'not applied'}."
+        f"Evaluated {len(evidence)} evidence source(s){chunk_info}, "
+        f"used {len(verdict.used_source_ids)} source(s) in the final answer, "
+        f"{relevant_count} met the relevance threshold of {settings.min_relevant_similarity:.2f}, "
+        f"and reranking was {'applied' if rerank_applied else 'not applied'}{verdict_info}."
     )
 
 
-def _build_evidence_candidates(retrieved: list[tuple[Any, float]], *, claim_text: str) -> list[dict[str, Any]]:
+def _build_evidence_candidates(
+    retrieved: list[tuple[Any, float]],
+    *,
+    claim_text: str,
+) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for initial_rank, (source, similarity_score) in enumerate(retrieved, start=1):
         metadata = source.source_meta or {}
@@ -310,11 +302,24 @@ def _apply_verdict_guardrails(
     claim_text: str,
     language: str,
     evidence: list[dict[str, Any]],
+    classified_chunks: list[dict[str, Any]] | None = None,
 ) -> LLMVerdictSchema:
+    """
+    Apply post-hoc safety guardrails to the LLM verdict.
+
+    Ensures:
+    - Source IDs cited are actually in the evidence set
+    - Insufficient evidence cases are correctly downgraded
+    - Confidence is bounded by evidence quality
+    """
     valid_source_ids = {str(item["source_id"]) for item in evidence if item.get("source_id")}
-    filtered_source_ids = [source_id for source_id in verdict.used_source_ids if str(source_id) in valid_source_ids]
+    filtered_source_ids = [
+        source_id for source_id in verdict.used_source_ids if str(source_id) in valid_source_ids
+    ]
     relevant_evidence = [item for item in evidence if _is_relevant_evidence(item)]
-    trusted_evidence = [item for item in relevant_evidence if float(item.get("trust_score") or 0.50) > 0.50]
+    trusted_evidence = [
+        item for item in relevant_evidence if float(item.get("trust_score") or 0.50) > 0.50
+    ]
 
     extracted_claim = verdict.extracted_claim or claim_text
     detected_language = verdict.detected_language or language or "Unknown"
@@ -324,34 +329,67 @@ def _apply_verdict_guardrails(
     )
     user_response = verdict.user_response or explanation
     verdict_label = verdict.verdict
+    pipeline_verdict = getattr(verdict, "pipeline_verdict", None)
     confidence = min(max(float(verdict.confidence), 0.0), 1.0)
     confidence_label = verdict.confidence_label
+    warnings = list(getattr(verdict, "warnings", []))
 
+    # ── Stance-based insufficient_evidence check ──────────────────────────────
+    if classified_chunks:
+        supports_count = sum(1 for c in classified_chunks if c.get("stance") == "supports")
+        refutes_count = sum(1 for c in classified_chunks if c.get("stance") == "refutes")
+        total_chunks = len(classified_chunks)
+        strong_chunks = supports_count + refutes_count
+        # If less than 20% of chunks are directly relevant (support/refute), evidence is weak
+        if total_chunks > 0 and strong_chunks / total_chunks < 0.2:
+            if verdict_label not in {"Not Enough Evidence"}:
+                verdict_label = "Not Enough Evidence"
+                pipeline_verdict = "insufficient_evidence"
+                confidence = min(confidence, 0.40)
+                confidence_label = "Low"
+                explanation = (
+                    "Most retrieved evidence does not directly support or refute the claim."
+                )
+                user_response = (
+                    "JachAI Verdict: Insufficient Evidence. "
+                    "The available sources do not directly address this claim."
+                )
+                warnings.append(
+                    f"Only {strong_chunks}/{total_chunks} evidence chunks directly relevant."
+                )
+
+    # ── No evidence at all ────────────────────────────────────────────────────
     if not evidence:
         verdict_label = "Not Enough Evidence"
+        pipeline_verdict = "insufficient_evidence"
         confidence = min(confidence, 0.35)
         confidence_label = "Low"
         explanation = "JachAI could not find enough reliable evidence from trusted sources to verify this claim."
         user_response = (
-            "JachAI Verdict: Not Enough Evidence. We could not find enough reliable sources to verify this claim yet."
+            "JachAI Verdict: Insufficient Evidence. "
+            "We could not find enough reliable sources to verify this claim yet."
         )
         filtered_source_ids = []
     elif not relevant_evidence:
         verdict_label = "Not Enough Evidence"
+        pipeline_verdict = "insufficient_evidence"
         confidence = min(confidence, 0.45)
         confidence_label = "Low"
         explanation = "The retrieved evidence is too weak or only loosely related to this claim."
         user_response = (
-            "JachAI Verdict: Not Enough Evidence. The available sources are not strong enough to verify this claim."
+            "JachAI Verdict: Insufficient Evidence. "
+            "The available sources are not strong enough to verify this claim."
         )
         filtered_source_ids = []
 
+    # ── Misleading detection via text signals ─────────────────────────────────
     if (
         verdict_label == "Not Enough Evidence"
         and trusted_evidence
         and _looks_like_unsupported_detail(explanation, user_response)
     ):
         verdict_label = "Misleading"
+        pipeline_verdict = "misleading"
         confidence = max(min(confidence, 0.65), 0.55)
         confidence_label = "Medium"
         explanation = (
@@ -364,14 +402,16 @@ def _apply_verdict_guardrails(
         if not filtered_source_ids:
             filtered_source_ids = _source_ids_from_evidence(trusted_evidence)
 
+    # ── Require at least one cited source for strong verdicts ─────────────────
     if verdict_label in {"Likely True", "Likely False"} and not filtered_source_ids:
         verdict_label = "Not Enough Evidence"
+        pipeline_verdict = "insufficient_evidence"
         confidence = min(confidence, 0.35)
         confidence_label = "Low"
         explanation = "A strong true or false verdict needs at least one valid supporting source."
         user_response = (
-            "JachAI Verdict: Not Enough Evidence. We need at least one trustworthy source before giving a strong "
-            "true or false verdict."
+            "JachAI Verdict: Insufficient Evidence. "
+            "We need at least one trustworthy source before giving a strong true or false verdict."
         )
 
     if not filtered_source_ids and confidence_label == "High":
@@ -387,12 +427,13 @@ def _apply_verdict_guardrails(
         confidence_label = "Medium" if confidence >= 0.5 else "Low"
         if verdict_label in {"Likely True", "Likely False"}:
             verdict_label = "Not Enough Evidence"
+            pipeline_verdict = "insufficient_evidence"
             confidence = min(confidence, 0.45)
             confidence_label = "Low"
             explanation = "A strong verdict needs support from at least one trusted domain."
             user_response = (
-                "JachAI Verdict: Not Enough Evidence. The available sources are not trusted enough for a strong "
-                "true or false verdict."
+                "JachAI Verdict: Insufficient Evidence. "
+                "The available sources are not trusted enough for a strong true or false verdict."
             )
 
     if not confidence_label:
@@ -409,6 +450,8 @@ def _apply_verdict_guardrails(
             "explanation": explanation,
             "user_response": user_response,
             "used_source_ids": filtered_source_ids,
+            "pipeline_verdict": pipeline_verdict,
+            "warnings": warnings,
         }
     )
 
@@ -422,6 +465,8 @@ def _parse_ai_usage(context_payload: dict[str, Any]) -> AIUsageSchema | None:
     except ValidationError:
         return None
 
+
+# ── Serialization ─────────────────────────────────────────────────────────────
 
 def serialize_job(job: VerificationJob) -> VerificationJobSchema:
     return VerificationJobSchema(
@@ -446,6 +491,18 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
         for item in context_payload.get("evidence", [])
         if isinstance(item, dict) and item.get("source_id")
     }
+    # Build stance lookup from classified_chunks if available
+    stance_lookup: dict[str, str] = {}
+    credibility_lookup: dict[str, float] = {}
+    for chunk in context_payload.get("classified_chunks", []):
+        if isinstance(chunk, dict) and chunk.get("source_id"):
+            sid = str(chunk["source_id"])
+            if "stance" in chunk and sid not in stance_lookup:
+                stance_lookup[sid] = str(chunk["stance"])
+    for cred in context_payload.get("credibility_scores", []):
+        if isinstance(cred, dict) and cred.get("source_id"):
+            credibility_lookup[str(cred["source_id"])] = float(cred.get("credibility_score") or 0.5)
+
     evidence = [
         EvidenceSnippetSchema(
             source_id=link.source.id,
@@ -455,7 +512,9 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
             language=link.source.language,
             source_type=link.source.source_type,
             snippet=link.source.snippet,
-            similarity_score=float(evidence_metadata.get(str(link.source.id), {}).get("similarity_score", link.similarity_score)),
+            similarity_score=float(
+                evidence_metadata.get(str(link.source.id), {}).get("similarity_score", link.similarity_score)
+            ),
             match_score=evidence_metadata.get(str(link.source.id), {}).get("match_score"),
             rerank_score=evidence_metadata.get(str(link.source.id), {}).get("rerank_score"),
             search_score=evidence_metadata.get(str(link.source.id), {}).get("search_score"),
@@ -463,6 +522,9 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
             provider=evidence_metadata.get(str(link.source.id), {}).get("provider"),
             initial_rank=evidence_metadata.get(str(link.source.id), {}).get("initial_rank"),
             final_rank=evidence_metadata.get(str(link.source.id), {}).get("final_rank", link.rank),
+            stance=stance_lookup.get(str(link.source.id)),
+            credibility_score=credibility_lookup.get(str(link.source.id)),
+            snippet_only=bool(evidence_metadata.get(str(link.source.id), {}).get("snippet_only", False)),
         )
         for link in sorted(claim.evidence_links, key=lambda item: item.rank)
         if link.source is not None
@@ -483,7 +545,9 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
         review_status=claim.review_status,
         verdict=claim.verdict,
         confidence=claim.confidence,
-        confidence_label=str(context_payload.get("confidence_label") or _confidence_label_from_score(claim.confidence)),
+        confidence_label=str(
+            context_payload.get("confidence_label") or _confidence_label_from_score(claim.confidence)
+        ),
         explanation=claim.explanation,
         user_response=str(context_payload.get("user_response") or claim.share_summary),
         reasoning=claim.reasoning,
@@ -495,6 +559,8 @@ def serialize_claim(claim: Claim) -> ClaimResponseSchema:
         context_payload=context_payload,
     )
 
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
 
 async def _load_claim(session: AsyncSession, claim_id: UUID | str) -> Claim | None:
     parsed_id = _parse_uuid(claim_id, code="INVALID_CLAIM_ID", message="Claim ID must be a valid UUID.")
@@ -550,20 +616,25 @@ async def _fail_job(
     persisted_job.completed_at = utc_now()
     await session.commit()
     await session.refresh(persisted_job)
-    await cache_service.set_job_status(str(persisted_job.id), serialize_job(persisted_job).model_dump(mode="json"))
+    await cache_service.set_job_status(
+        str(persisted_job.id), serialize_job(persisted_job).model_dump(mode="json")
+    )
 
 
 async def _fetch_url_text(url: str) -> tuple[str, dict[str, Any]]:
+    """Fetch a URL and extract clean text. Used for URL-input claims."""
     try:
         async with httpx.AsyncClient(
             follow_redirects=True,
-            timeout=settings.request_timeout_seconds,
+            timeout=settings.fetch_timeout_seconds,
             headers={"User-Agent": "JachAI/0.1"},
         ) as client:
             response = await client.get(url)
             response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise AppError(status_code=422, code="URL_FETCH_FAILED", message=f"Could not fetch URL: {exc}") from exc
+        raise AppError(
+            status_code=422, code="URL_FETCH_FAILED", message=f"Could not fetch URL: {exc}"
+        ) from exc
 
     text = text_from_html(response.text)
     if len(text) < 20:
@@ -592,6 +663,8 @@ async def _return_existing_claim(
     return ClaimSubmissionResponseSchema(job=serialize_job(job), claim=serialized, cached=cached_hit)
 
 
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+
 async def _pipeline_from_text(
     session: AsyncSession,
     *,
@@ -600,9 +673,32 @@ async def _pipeline_from_text(
     source_url: str | None = None,
     context_payload: dict[str, Any] | None = None,
 ) -> ClaimSubmissionResponseSchema:
+    """
+    Full evidence-based claim verification pipeline.
+
+    Stages:
+    1. Input normalization
+    2. Claim extraction (LLM)
+    3. Query generation (LLM)
+    4. Tavily search + evidence fetching
+    5. Evidence chunking
+    6. Evidence reranking (NVIDIA or local fallback)
+    7. Source credibility scoring
+    8. Stance classification (LLM, per chunk)
+    9. pgvector retrieval (parallel, legacy path)
+    10. Final verdict (LLM, evidence-grounded)
+    11. Guardrails
+    12. Save + return
+    """
     job = await _create_job(session, input_type=input_type)
     try:
+        pipeline_start = time.perf_counter()
         claim_context = dict(context_payload or {})
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 1: Input normalization
+        # ─────────────────────────────────────────────────────────────────────
+        stage_start = time.perf_counter()
         cleaned_text = clean_text(raw_text)
         if len(cleaned_text) < 5:
             raise AppError(status_code=422, code="INPUT_TOO_SHORT", message="Claim text is too short.")
@@ -610,11 +706,14 @@ async def _pipeline_from_text(
         language = detect_language(masked_text)
         content_hash = normalized_hash(masked_text)
         hash_value = normalized_hash(f"{settings.verification_pipeline_version}:{content_hash}")
-        claim_context.update(
-            {
-                "content_hash": content_hash,
-                "verification_pipeline_version": settings.verification_pipeline_version,
-            }
+        claim_context.update({
+            "content_hash": content_hash,
+            "verification_pipeline_version": settings.verification_pipeline_version,
+        })
+        logger.info(
+            "pipeline_stage stage=input_normalization duration_ms=%.1f "
+            "hash=%.16s language=%s",
+            (time.perf_counter() - stage_start) * 1000, hash_value, language,
         )
 
         job.normalized_hash = hash_value
@@ -622,6 +721,7 @@ async def _pipeline_from_text(
         await session.refresh(job)
         await cache_service.set_job_status(str(job.id), serialize_job(job).model_dump(mode="json"))
 
+        # ── Cache / dedup check ───────────────────────────────────────────────
         duplicate_claim_id = await cache_service.get_duplicate_claim_id(hash_value)
         if duplicate_claim_id:
             existing = await _load_claim(session, duplicate_claim_id)
@@ -649,27 +749,146 @@ async def _pipeline_from_text(
                 message="Verification is busy right now. Please try again shortly.",
             )
 
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 2: Claim extraction
+        # ─────────────────────────────────────────────────────────────────────
+        stage_start = time.perf_counter()
         extraction, extraction_metadata = await extract_claim_context(
             masked_text,
             language,
             cache_key=hash_value,
         )
+        retrieval_query = extraction.extracted_claim or masked_text
+        logger.info(
+            "pipeline_stage stage=claim_extraction duration_ms=%.1f "
+            "claim=%.80s category=%s entities=%d requires_freshness=%s",
+            (time.perf_counter() - stage_start) * 1000,
+            retrieval_query, extraction.category,
+            len(extraction.entities), extraction.requires_freshness,
+        )
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 3: Query generation
+        # ─────────────────────────────────────────────────────────────────────
+        stage_start = time.perf_counter()
         query_generation, query_metadata = await generate_search_queries(
             extraction=extraction,
             original_text=masked_text,
             cache_key=hash_value,
         )
-        retrieval_query = extraction.extracted_claim or masked_text
+        flat_queries = query_generation.search_queries
+        logger.info(
+            "pipeline_stage stage=query_generation duration_ms=%.1f query_count=%d queries=%s",
+            (time.perf_counter() - stage_start) * 1000,
+            len(flat_queries),
+            flat_queries[:3],
+        )
 
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 4: Tavily search + evidence fetching
+        # ─────────────────────────────────────────────────────────────────────
+        stage_start = time.perf_counter()
         live_evidence = await hydrate_live_evidence(
             session,
             claim_text=retrieval_query,
             language=extraction.detected_language or language,
             normalized_hash=hash_value,
-            search_queries=query_generation.search_queries,
+            search_queries=flat_queries,
+            requires_freshness=extraction.requires_freshness,
         )
         claim_context["live_evidence"] = live_evidence
+        evidence_documents = live_evidence.get("evidence_documents", [])
+        pipeline_warnings: list[str] = list(live_evidence.get("pipeline_warnings", []))
+        logger.info(
+            "pipeline_stage stage=tavily_search duration_ms=%.1f "
+            "tavily_results=%d fetched_docs=%d failed_fetches=%d warnings=%d",
+            (time.perf_counter() - stage_start) * 1000,
+            live_evidence.get("tavily_result_count", 0),
+            len(evidence_documents),
+            live_evidence.get("tavily_result_count", 0) - len(evidence_documents),
+            len(pipeline_warnings),
+        )
 
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 5: Evidence chunking
+        # ─────────────────────────────────────────────────────────────────────
+        stage_start = time.perf_counter()
+        evidence_chunks = chunk_evidence_documents(evidence_documents)
+        logger.info(
+            "pipeline_stage stage=evidence_chunking duration_ms=%.1f chunk_count=%d",
+            (time.perf_counter() - stage_start) * 1000,
+            len(evidence_chunks),
+        )
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 6: Evidence ranking / reranking
+        # ─────────────────────────────────────────────────────────────────────
+        stage_start = time.perf_counter()
+        ranked_chunks, chunk_rerank_metadata = await rerank_evidence(
+            retrieval_query,
+            evidence_chunks,
+            claim_text=retrieval_query,
+            use_chunk_format=True,
+        )
+        logger.info(
+            "pipeline_stage stage=evidence_ranking duration_ms=%.1f "
+            "input_chunks=%d ranked_chunks=%d rerank_applied=%s",
+            (time.perf_counter() - stage_start) * 1000,
+            len(evidence_chunks),
+            len(ranked_chunks),
+            chunk_rerank_metadata.get("applied"),
+        )
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 7: Source credibility scoring
+        # ─────────────────────────────────────────────────────────────────────
+        stage_start = time.perf_counter()
+        credibility_scores: list[dict[str, Any]] = []
+        seen_sources: set[str] = set()
+        for chunk in ranked_chunks:
+            source_id = str(chunk.get("source_id") or "")
+            if source_id and source_id not in seen_sources:
+                seen_sources.add(source_id)
+                cred = score_source_credibility(
+                    source_id=source_id,
+                    domain=chunk.get("domain"),
+                    snippet_only=bool(chunk.get("snippet_only", False)),
+                    published_date=chunk.get("published_date"),
+                    requires_freshness=extraction.requires_freshness,
+                )
+                credibility_scores.append(cred)
+        logger.info(
+            "pipeline_stage stage=source_credibility duration_ms=%.1f sources_scored=%d",
+            (time.perf_counter() - stage_start) * 1000,
+            len(credibility_scores),
+        )
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 8: Stance classification
+        # ─────────────────────────────────────────────────────────────────────
+        stage_start = time.perf_counter()
+        # Select top chunks for classification (cap at max_evidence_chunks)
+        top_chunks_for_classification = ranked_chunks[: settings.max_evidence_chunks]
+        classified_chunks = await classify_evidence_stances(
+            top_chunks_for_classification,
+            normalized_claim=retrieval_query,
+        )
+        supports_count = sum(1 for c in classified_chunks if c.get("stance") == "supports")
+        refutes_count = sum(1 for c in classified_chunks if c.get("stance") == "refutes")
+        logger.info(
+            "pipeline_stage stage=stance_classification duration_ms=%.1f "
+            "chunks=%d supports=%d refutes=%d neutral=%d",
+            (time.perf_counter() - stage_start) * 1000,
+            len(classified_chunks),
+            supports_count,
+            refutes_count,
+            len(classified_chunks) - supports_count - refutes_count,
+        )
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 9: pgvector retrieval (legacy path — runs in parallel with live evidence)
+        # ─────────────────────────────────────────────────────────────────────
+        stage_start = time.perf_counter()
         evidence_index = await get_evidence_index_status(session)
         claim_context["evidence_index"] = {
             "ready": evidence_index.ready,
@@ -684,20 +903,58 @@ async def _pipeline_from_text(
         retrieved_candidates = _build_evidence_candidates(retrieved, claim_text=retrieval_query)
         selected_evidence, rerank_metadata = await rerank_evidence(retrieval_query, retrieved_candidates)
         selected_evidence = _filter_selected_evidence(selected_evidence)
+        logger.info(
+            "pipeline_stage stage=pgvector_retrieval duration_ms=%.1f "
+            "retrieved=%d selected=%d rerank_applied=%s",
+            (time.perf_counter() - stage_start) * 1000,
+            len(retrieved_candidates),
+            len(selected_evidence),
+            rerank_metadata.get("applied"),
+        )
 
-        verdict, llm_metadata = await generate_verdict(extraction, selected_evidence)
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 10: Final verdict generation
+        # ─────────────────────────────────────────────────────────────────────
+        stage_start = time.perf_counter()
+        verdict, llm_metadata = await generate_verdict(
+            extraction,
+            selected_evidence,
+            classified_chunks=classified_chunks,
+            credibility_scores=credibility_scores,
+            pipeline_warnings=pipeline_warnings,
+        )
         verdict = _apply_verdict_guardrails(
             verdict,
             claim_text=cleaned_text,
             language=language,
             evidence=selected_evidence,
+            classified_chunks=classified_chunks,
+        )
+        pipeline_verdict = getattr(verdict, "pipeline_verdict", None)
+        logger.info(
+            "pipeline_stage stage=verdict_generation duration_ms=%.1f "
+            "verdict=%s pipeline_verdict=%s confidence=%.2f warnings=%d",
+            (time.perf_counter() - stage_start) * 1000,
+            verdict.verdict, pipeline_verdict,
+            verdict.confidence, len(getattr(verdict, "warnings", [])),
         )
 
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 11: Build AI usage payload
+        # ─────────────────────────────────────────────────────────────────────
         reasoning_model = llm_metadata.get("model") or get_model_for_task(NVIDIAModelTask.CLAIM_REASONING)
-        claim_extraction_model = extraction_metadata.get("model") or get_model_for_task(NVIDIAModelTask.CLAIM_EXTRACTION)
-        query_generation_model = query_metadata.get("model") or get_model_for_task(NVIDIAModelTask.SEARCH_QUERY_GENERATION)
+        claim_extraction_model = (
+            extraction_metadata.get("model") or get_model_for_task(NVIDIAModelTask.CLAIM_EXTRACTION)
+        )
+        query_generation_model = (
+            query_metadata.get("model") or get_model_for_task(NVIDIAModelTask.SEARCH_QUERY_GENERATION)
+        )
         rerank_model = rerank_metadata.get("model")
-        vision_model = str(claim_context.get("nvidia_vision_model")) if claim_context.get("nvidia_vision_model") else None
+        vision_model = (
+            str(claim_context.get("nvidia_vision_model"))
+            if claim_context.get("nvidia_vision_model")
+            else None
+        )
         ai_usage = _build_ai_usage_payload(
             claim_extraction_model=claim_extraction_model,
             query_generation_model=query_generation_model,
@@ -709,45 +966,78 @@ async def _pipeline_from_text(
                 int(extraction_metadata.get("call_count", 0))
                 + int(query_metadata.get("call_count", 0))
                 + int(llm_metadata.get("call_count", 0))
+                + len(classified_chunks)  # one call per classified chunk
             ),
-            rerank_call_count=int(rerank_metadata.get("call_count", 0)),
+            rerank_call_count=(
+                int(rerank_metadata.get("call_count", 0))
+                + int(chunk_rerank_metadata.get("call_count", 0))
+            ),
             vision_call_count=1 if claim_context.get("ocr_method") == "nvidia_vision_fallback" else 0,
             tavily_request_count=int(live_evidence.get("tavily_request_count", 0)),
         )
-        claim_context.update(
-            {
-                "extracted_claim": verdict.extracted_claim,
-                "detected_language": verdict.detected_language,
-                "category": verdict.category,
-                "confidence_label": verdict.confidence_label,
-                "user_response": verdict.user_response,
-                "factual_summary": verdict.user_response,
-                "claim_extraction_model": claim_extraction_model,
-                "query_generation_model": query_generation_model,
-                "nvidia_reasoning_model": reasoning_model,
-                "claim_extraction": {
-                    "query_used_for_retrieval": retrieval_query,
-                    "call_count": int(extraction_metadata.get("call_count", 0)),
-                },
-                "search_query_generation": {
-                    "queries": query_generation.search_queries,
-                    "call_count": int(query_metadata.get("call_count", 0)),
-                },
-                "search_answer_context": live_evidence.get("search_answer_context"),
-                "search_provider": "tavily",
-                "retrieval": {
-                    "candidate_count": len(retrieved_candidates),
-                    "selected_count": len(selected_evidence),
-                    "pgvector_top_k": settings.pgvector_top_k,
-                    "final_evidence_top_k": settings.final_evidence_top_k,
-                    "min_relevant_similarity": settings.min_relevant_similarity,
-                },
-                "rerank": rerank_metadata,
-                "evidence": selected_evidence,
-                "ai_usage": ai_usage,
-            }
-        )
 
+        claim_context.update({
+            "extracted_claim": verdict.extracted_claim,
+            "detected_language": verdict.detected_language,
+            "category": verdict.category,
+            "confidence_label": verdict.confidence_label,
+            "user_response": verdict.user_response,
+            "factual_summary": verdict.user_response,
+            "pipeline_verdict": pipeline_verdict,
+            "pipeline_warnings": pipeline_warnings + list(getattr(verdict, "warnings", [])),
+            "claim_extraction_model": claim_extraction_model,
+            "query_generation_model": query_generation_model,
+            "nvidia_reasoning_model": reasoning_model,
+            "claim_extraction": {
+                "query_used_for_retrieval": retrieval_query,
+                "entities": extraction.entities,
+                "time_context": extraction.time_context,
+                "location_context": extraction.location_context,
+                "requires_freshness": extraction.requires_freshness,
+                "verification_strategy": extraction.verification_strategy,
+                "call_count": int(extraction_metadata.get("call_count", 0)),
+            },
+            "search_query_generation": {
+                "queries": [q.model_dump() for q in query_generation.queries],
+                "search_queries": flat_queries,
+                "call_count": int(query_metadata.get("call_count", 0)),
+            },
+            "search_answer_context": live_evidence.get("search_answer_context"),
+            "search_provider": "tavily",
+            "retrieval": {
+                "candidate_count": len(retrieved_candidates),
+                "selected_count": len(selected_evidence),
+                "pgvector_top_k": settings.pgvector_top_k,
+                "final_evidence_top_k": settings.final_evidence_top_k,
+                "min_relevant_similarity": settings.min_relevant_similarity,
+            },
+            "evidence_chunking": {
+                "doc_count": len(evidence_documents),
+                "chunk_count": len(evidence_chunks),
+                "ranked_chunk_count": len(ranked_chunks),
+                "classified_chunk_count": len(classified_chunks),
+            },
+            "rerank": rerank_metadata,
+            "chunk_rerank": chunk_rerank_metadata,
+            "credibility_scores": credibility_scores,
+            "classified_chunks": [
+                {
+                    "chunk_id": c.get("chunk_id"),
+                    "source_id": c.get("source_id"),
+                    "stance": c.get("stance"),
+                    "stance_confidence": c.get("stance_confidence"),
+                    "rationale": c.get("rationale"),
+                    "quoted_evidence": c.get("quoted_evidence"),
+                }
+                for c in classified_chunks
+            ],
+            "evidence": selected_evidence,
+            "ai_usage": ai_usage,
+        })
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Stage 12: Persist claim
+        # ─────────────────────────────────────────────────────────────────────
         cluster = await get_or_create_cluster(
             session,
             topic_hash=hash_value,
@@ -772,6 +1062,7 @@ async def _pipeline_from_text(
                 verdict,
                 selected_evidence,
                 rerank_applied=bool(rerank_metadata.get("applied")),
+                classified_chunks=classified_chunks,
             ),
             share_summary=verdict.user_response,
             review_status="pending",
@@ -784,8 +1075,14 @@ async def _pipeline_from_text(
             cluster.representative_claim_id = claim.id
 
         source_lookup = {str(item["source_id"]): item for item in selected_evidence}
-        ordered_source_ids = [str(source_id) for source_id in verdict.used_source_ids if str(source_id) in source_lookup]
-        fallback_ids = [source_id for source_id in source_lookup.keys() if source_id not in ordered_source_ids]
+        ordered_source_ids = [
+            str(source_id)
+            for source_id in verdict.used_source_ids
+            if str(source_id) in source_lookup
+        ]
+        fallback_ids = [
+            source_id for source_id in source_lookup.keys() if source_id not in ordered_source_ids
+        ]
         for position, source_id in enumerate(ordered_source_ids + fallback_ids, start=1):
             source_item = source_lookup[source_id]
             session.add(
@@ -809,6 +1106,8 @@ async def _pipeline_from_text(
                     "verification_pipeline_version": settings.verification_pipeline_version,
                     "language": language,
                     "input_type": input_type,
+                    "pipeline_verdict": pipeline_verdict,
+                    "verdict": verdict.verdict,
                     "ai_usage": ai_usage,
                 },
             )
@@ -836,6 +1135,15 @@ async def _pipeline_from_text(
             hash_value,
             {"claim_id": str(persisted_claim.id), "job_id": str(job.id), "cached": False},
         )
+
+        total_ms = (time.perf_counter() - pipeline_start) * 1000
+        logger.info(
+            "pipeline_complete total_ms=%.1f verdict=%s pipeline_verdict=%s "
+            "evidence_docs=%d chunks=%d classified=%d warnings=%d",
+            total_ms, verdict.verdict, pipeline_verdict,
+            len(evidence_documents), len(evidence_chunks),
+            len(classified_chunks), len(pipeline_warnings),
+        )
         return ClaimSubmissionResponseSchema(
             job=serialize_job(job),
             claim=serialize_claim(persisted_claim),
@@ -853,6 +1161,8 @@ async def _pipeline_from_text(
         )
         raise
 
+
+# ── Public pipeline entry points ──────────────────────────────────────────────
 
 async def process_text_claim(
     session: AsyncSession,
@@ -910,6 +1220,8 @@ async def process_image_claim(
         vision_model = get_model_for_task(NVIDIAModelTask.IMAGE_OCR_FALLBACK)
         if vision_model:
             metadata["nvidia_vision_model"] = vision_model
+    # OCR text may be noisy — add warning in context
+    metadata["ocr_warning"] = "Input extracted via OCR — text may contain noise or errors."
     return await _pipeline_from_text(
         session,
         input_type="image",
@@ -917,6 +1229,8 @@ async def process_image_claim(
         context_payload=metadata,
     )
 
+
+# ── Read-only pipeline operations ─────────────────────────────────────────────
 
 async def get_claim_by_id(session: AsyncSession, claim_id: UUID | str) -> ClaimResponseSchema | None:
     claim = await _load_claim(session, claim_id)
