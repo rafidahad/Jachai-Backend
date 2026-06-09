@@ -337,6 +337,11 @@ class Settings(BaseSettings):
     def tavily_enabled(self) -> bool:
         return self.normalized_search_provider == "tavily" and bool(self.active_tavily_api_key)
 
+    @property
+    def embedding_uses_gemini(self) -> bool:
+        normalized = self.embedding_model.strip().lower()
+        return normalized.startswith("gemini-embedding-")
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

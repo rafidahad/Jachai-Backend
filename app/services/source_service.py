@@ -42,7 +42,11 @@ async def ingest_sources(
         cleaned_snippet = clean_text(item.snippet)
         cleaned_text = clean_text(item.text_content)
         language = item.language or detect_language(cleaned_text)
-        embedding = await embed_text(cleaned_text)
+        embedding = await embed_text(
+            cleaned_text,
+            task_type="RETRIEVAL_DOCUMENT",
+            title=item.title,
+        )
 
         existing = await session.scalar(select(EvidenceSource).where(EvidenceSource.url == str(item.url)))
         if existing:

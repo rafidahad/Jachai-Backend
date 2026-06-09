@@ -24,3 +24,33 @@ def test_detect_language_handles_romanized_bangla_without_native_script() -> Non
 
 def test_normalized_hash_is_whitespace_insensitive() -> None:
     assert normalized_hash("Fact check me") == normalized_hash("  fact   check me  ")
+
+
+def test_embed_text_uses_gemini_embeddings_with_retrieval_task_types() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    from app.services.embedding_service import embed_text
+
+    async def run() -> list[float]:
+        with patch("app.services.embedding_service.settings") as mock_settings:
+            mock_settings.embedding_uses_gemini = True
+            mock_settings.embedding_model = "gemini-embedding-2"
+            mock_settings.embedding_dim = 1024
+            with patch(
+                "app.services.embedding_service.call_gemini_embed_content",
+                new_callable=AsyncMock,
+                return_value=[3.0, 4.0],
+            ) as mock_embed:
+                values = await embed_text(
+                    "Bangla claim text",
+                    task_type="RETRIEVAL_QUERY",
+                )
+                kwargs = mock_embed.await_args.kwargs
+                assert kwargs["model"] == "gemini-embedding-2"
+                assert kwargs["output_dimensionality"] == 1024
+                assert kwargs["task_type"] == "RETRIEVAL_QUERY"
+                return values
+
+    normalized = asyncio.run(run())
+    assert normalized == [0.6, 0.8]

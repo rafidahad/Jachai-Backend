@@ -973,7 +973,10 @@ async def _pipeline_from_text(
             "message": evidence_index.message,
         }
 
-        embedding = await embed_text(retrieval_query)
+        embedding = await embed_text(
+            retrieval_query,
+            task_type="RETRIEVAL_QUERY",
+        )
         retrieved = await retrieve_evidence(session, embedding, top_k=settings.pgvector_top_k)
         retrieved_candidates = _build_evidence_candidates(retrieved, claim_text=retrieval_query)
         selected_evidence, rerank_metadata = await rerank_evidence(retrieval_query, retrieved_candidates)
