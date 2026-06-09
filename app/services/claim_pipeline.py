@@ -454,7 +454,7 @@ def _build_initial_live_status(
         "events": [],
         "updated_at": utc_now().isoformat(),
     }
-    if source_url:
+    if source_url and not live_status["raw_input"]:
         live_status["raw_input"] = source_url
     if metadata.get("ocr_warning"):
         _set_live_warning_messages(live_status, [str(metadata["ocr_warning"])])
@@ -466,6 +466,27 @@ def _build_initial_live_status(
         summary="Verification job created and waiting for engine execution.",
         metadata={"input_type": input_type},
     )
+
+
+def _normalize_supporting_text(value: str | None) -> str | None:
+    cleaned = clean_text(value or "")
+    return cleaned or None
+
+
+def _compose_claim_source_input(
+    *,
+    primary_text: str,
+    supporting_text: str | None = None,
+    source_label: str,
+) -> str:
+    cleaned_primary = clean_text(primary_text)
+    cleaned_supporting = _normalize_supporting_text(supporting_text)
+
+    if cleaned_supporting and cleaned_primary:
+        return f"User note:\n{cleaned_supporting}\n\n{source_label}:\n{cleaned_primary}"
+    if cleaned_primary:
+        return cleaned_primary
+    return cleaned_supporting or ""
 
 
 def _evidence_preview(items: list[dict[str, Any]], *, limit: int = 4) -> list[dict[str, Any]]:
@@ -1991,14 +2012,23 @@ async def process_url_claim(
     session: AsyncSession,
     url: str,
     external_id: str | None = None,
+    supporting_text: str | None = None,
 ) -> ClaimSubmissionResponseSchema:
     text, metadata = await _fetch_url_text(url)
     if external_id:
         metadata["external_id"] = external_id
+    cleaned_supporting_text = _normalize_supporting_text(supporting_text)
+    if cleaned_supporting_text:
+        metadata["supporting_text"] = cleaned_supporting_text
+    combined_text = _compose_claim_source_input(
+        primary_text=text,
+        supporting_text=cleaned_supporting_text,
+        source_label="Page text",
+    )
     return await _pipeline_from_text(
         session,
         input_type="url",
-        raw_text=text,
+        raw_text=combined_text,
         source_url=url,
         context_payload=metadata,
     )
@@ -2010,6 +2040,7 @@ async def process_image_claim(
     filename: str | None = None,
     content_type: str | None = None,
     external_id: str | None = None,
+    supporting_text: str | None = None,
 ) -> ClaimSubmissionResponseSchema:
     max_bytes = settings.max_image_size_mb * 1024 * 1024
     if len(image_bytes) > max_bytes:
@@ -2028,6 +2059,9 @@ async def process_image_claim(
         metadata["filename"] = filename
     if external_id:
         metadata["external_id"] = external_id
+    cleaned_supporting_text = _normalize_supporting_text(supporting_text)
+    if cleaned_supporting_text:
+        metadata["supporting_text"] = cleaned_supporting_text
     vision_model = get_model_for_task(NVIDIAModelTask.IMAGE_OCR)
     if vision_model:
         metadata["ocr_model"] = vision_model
@@ -2035,10 +2069,15 @@ async def process_image_claim(
     metadata["ocr_warning"] = "Input extracted via OCR — text may contain noise or errors."
     metadata["ocr_line_count"] = len([line for line in ocr_text.splitlines() if clean_text(line)])
     metadata["ocr_text_compacted"] = text != clean_text(ocr_text)
+    combined_text = _compose_claim_source_input(
+        primary_text=text,
+        supporting_text=cleaned_supporting_text,
+        source_label="Image text",
+    )
     return await _pipeline_from_text(
         session,
         input_type="image",
-        raw_text=text,
+        raw_text=combined_text,
         context_payload=metadata,
     )
 
@@ -2066,13 +2105,17 @@ async def enqueue_url_claim(
     session: AsyncSession,
     url: str,
     external_id: str | None = None,
+    supporting_text: str | None = None,
 ) -> ClaimSubmissionResponseSchema:
+    cleaned_supporting_text = _normalize_supporting_text(supporting_text)
     context: dict[str, Any] = {"source_url": url}
     if external_id:
         context["external_id"] = external_id
+    if cleaned_supporting_text:
+        context["supporting_text"] = cleaned_supporting_text
     live_status = _build_initial_live_status(
         input_type="url",
-        raw_input=url,
+        raw_input=cleaned_supporting_text or url,
         source_url=url,
         context_payload=context,
     )
@@ -2090,7 +2133,9 @@ async def enqueue_image_claim(
     filename: str | None = None,
     content_type: str | None = None,
     external_id: str | None = None,
+    supporting_text: str | None = None,
 ) -> ClaimSubmissionResponseSchema:
+    cleaned_supporting_text = _normalize_supporting_text(supporting_text)
     metadata: dict[str, Any] = {
         "filename": filename,
         "content_type": content_type,
@@ -2100,8 +2145,11 @@ async def enqueue_image_claim(
     }
     if external_id:
         metadata["external_id"] = external_id
+    if cleaned_supporting_text:
+        metadata["supporting_text"] = cleaned_supporting_text
     live_status = _build_initial_live_status(
         input_type="image",
+        raw_input=cleaned_supporting_text,
         context_payload=metadata,
     )
     job = await _create_job(session, input_type="image", status="queued", live_status=live_status)
@@ -2149,14 +2197,19 @@ async def run_url_claim_job(
     *,
     url: str,
     external_id: str | None = None,
+    supporting_text: str | None = None,
 ) -> None:
     async with SessionLocal() as session:
         job = await _get_job_for_execution(session, job_id)
+        cleaned_supporting_text = _normalize_supporting_text(supporting_text)
         live_status = await _load_live_status(job.id) or _build_initial_live_status(
             input_type="url",
-            raw_input=url,
+            raw_input=cleaned_supporting_text or url,
             source_url=url,
-            context_payload={"source_url": url},
+            context_payload={
+                "source_url": url,
+                **({"supporting_text": cleaned_supporting_text} if cleaned_supporting_text else {}),
+            },
         )
         try:
             await _ensure_job_processing(session, job, live_status=live_status)
@@ -2173,6 +2226,13 @@ async def run_url_claim_job(
             text, metadata = await _fetch_url_text(url)
             if external_id:
                 metadata["external_id"] = external_id
+            if cleaned_supporting_text:
+                metadata["supporting_text"] = cleaned_supporting_text
+            combined_text = _compose_claim_source_input(
+                primary_text=text,
+                supporting_text=cleaned_supporting_text,
+                source_label="Page text",
+            )
             _append_live_event(
                 live_status,
                 key="url_fetch_complete",
@@ -2190,7 +2250,7 @@ async def run_url_claim_job(
                     "status_code": metadata.get("status_code"),
                 },
             )
-            live_status["raw_input"] = _preview_text(text)
+            live_status["raw_input"] = _preview_text(combined_text)
         except AppError as exc:
             _set_live_stage(live_status, "failed", message=exc.message)
             _append_live_event(
@@ -2227,7 +2287,7 @@ async def run_url_claim_job(
             await _pipeline_from_text(
                 session,
                 input_type="url",
-                raw_text=text,
+                raw_text=combined_text,
                 source_url=url,
                 context_payload=metadata,
                 job=job,
@@ -2246,16 +2306,20 @@ async def run_image_claim_job(
     filename: str | None = None,
     content_type: str | None = None,
     external_id: str | None = None,
+    supporting_text: str | None = None,
 ) -> None:
     async with SessionLocal() as session:
         job = await _get_job_for_execution(session, job_id)
+        cleaned_supporting_text = _normalize_supporting_text(supporting_text)
         live_status = await _load_live_status(job.id) or _build_initial_live_status(
             input_type="image",
+            raw_input=cleaned_supporting_text,
             context_payload={
                 "filename": filename,
                 "content_type": content_type,
                 "ocr_method": "kimi_ocr",
                 "ocr_model": get_model_for_task(NVIDIAModelTask.IMAGE_OCR),
+                **({"supporting_text": cleaned_supporting_text} if cleaned_supporting_text else {}),
             },
         )
         try:
@@ -2285,7 +2349,14 @@ async def run_image_claim_job(
             }
             if external_id:
                 metadata["external_id"] = external_id
-            live_status["raw_input"] = _preview_text(text)
+            if cleaned_supporting_text:
+                metadata["supporting_text"] = cleaned_supporting_text
+            combined_text = _compose_claim_source_input(
+                primary_text=text,
+                supporting_text=cleaned_supporting_text,
+                source_label="Image text",
+            )
+            live_status["raw_input"] = _preview_text(combined_text)
             _merge_live_details(
                 live_status,
                 "input",
@@ -2344,7 +2415,7 @@ async def run_image_claim_job(
             await _pipeline_from_text(
                 session,
                 input_type="image",
-                raw_text=text,
+                raw_text=combined_text,
                 context_payload=metadata,
                 job=job,
                 live_status=live_status,

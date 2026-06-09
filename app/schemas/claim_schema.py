@@ -21,6 +21,7 @@ class ClaimTextRequest(StrictBaseModel):
 
 class ClaimURLRequest(StrictBaseModel):
     url: HttpUrl
+    supporting_text: StrictStr | None = Field(default=None, max_length=5000)
     external_id: StrictStr | None = Field(default=None, max_length=128)
 
 

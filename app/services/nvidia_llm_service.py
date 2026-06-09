@@ -44,6 +44,9 @@ Important rules:
 - Extract the single clearest factual claim that can be checked.
 - Remove greetings, hashtags, calls to action, and repeated noise.
 - Keep the extracted claim faithful to the user's meaning.
+- The input may include a short user note such as "is this true?" along with OCR text or article text.
+- Treat helper notes as context for disambiguation, not as the claim itself, unless the note contains a concrete factual statement.
+- If the input is structured with labels like "User note:", "Image text:", or "Page text:", extract the factual claim from the content text while using the note only to understand what the user wants checked.
 - If the input already contains a clean single claim, copy that claim nearly verbatim.
 - Do not paraphrase, strengthen, weaken, translate, or "improve" the claim wording unless needed to remove obvious wrapper noise.
 - Preserve named entities, numbers, dates, locations, negations, modality, and legal or medical wording exactly when present.

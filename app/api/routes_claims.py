@@ -55,6 +55,7 @@ async def submit_text_claim(
 async def submit_image_claim(
     background_tasks: BackgroundTasks,
     image: UploadFile = File(...),
+    supporting_text: Annotated[str | None, Form()] = None,
     external_id: Annotated[str | None, Form()] = None,
     session: AsyncSession = Depends(get_db),
 ) -> ClaimSubmissionResponseSchema:
@@ -76,6 +77,7 @@ async def submit_image_claim(
         session,
         filename=image.filename,
         content_type=image.content_type,
+        supporting_text=supporting_text,
         external_id=external_id,
     )
     background_tasks.add_task(
@@ -84,6 +86,7 @@ async def submit_image_claim(
         image_bytes=image_bytes,
         filename=image.filename,
         content_type=image.content_type,
+        supporting_text=supporting_text,
         external_id=external_id,
     )
     return response
@@ -95,11 +98,17 @@ async def submit_url_claim(
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db),
 ) -> ClaimSubmissionResponseSchema:
-    response = await enqueue_url_claim(session, str(payload.url), payload.external_id)
+    response = await enqueue_url_claim(
+        session,
+        str(payload.url),
+        payload.external_id,
+        supporting_text=payload.supporting_text,
+    )
     background_tasks.add_task(
         run_url_claim_job,
         response.job.id,
         url=str(payload.url),
+        supporting_text=payload.supporting_text,
         external_id=payload.external_id,
     )
     return response
