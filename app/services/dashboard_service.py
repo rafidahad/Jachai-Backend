@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.claim import Claim
 from app.models.evidence_source import EvidenceSource
 from app.models.rumor_cluster import RumorCluster
+from app.models.verification_job import VerificationJob
 from app.schemas.dashboard_schema import (
     ClaimsOverTimeItemSchema,
     DistributionItemSchema,
@@ -18,6 +19,7 @@ from app.schemas.dashboard_schema import (
 
 async def get_summary_metrics(session: AsyncSession) -> SummaryMetricSchema:
     total_claims = await session.scalar(select(func.count()).select_from(Claim)) or 0
+    verification_runs = await session.scalar(select(func.count()).select_from(VerificationJob)) or 0
     claims_today = await session.scalar(
         select(func.count()).select_from(Claim).where(func.date(Claim.created_at) == func.current_date())
     ) or 0
@@ -40,6 +42,7 @@ async def get_summary_metrics(session: AsyncSession) -> SummaryMetricSchema:
     ) or 0
     return SummaryMetricSchema(
         total_claims=int(total_claims),
+        verification_runs=int(verification_runs),
         claims_today=int(claims_today),
         reviewed_claims=int(reviewed_claims),
         total_sources=int(total_sources),

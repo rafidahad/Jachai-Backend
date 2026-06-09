@@ -11,6 +11,7 @@ from app.schemas.verdict_schema import LanguageLabel, VerdictLabel
 
 class SummaryMetricSchema(StrictBaseModel):
     total_claims: StrictInt
+    verification_runs: StrictInt
     claims_today: StrictInt
     reviewed_claims: StrictInt
     total_sources: StrictInt
