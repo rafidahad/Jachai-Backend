@@ -15,11 +15,17 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.db.session import SessionLocal
 from app.models.audit_log import AuditLog
 from app.models.claim import Claim, ClaimEvidenceLink
 from app.models.verification_job import VerificationJob
 from app.schemas.ai_schema import AIUsageSchema
-from app.schemas.claim_schema import ClaimResponseSchema, ClaimSubmissionResponseSchema, VerificationJobSchema
+from app.schemas.claim_schema import (
+    ClaimResponseSchema,
+    ClaimSubmissionResponseSchema,
+    VerificationJobSchema,
+    VerificationLiveStatusSchema,
+)
 from app.schemas.rerank_schema import EvidenceCandidateSchema
 from app.schemas.verdict_schema import EvidenceSnippetSchema, LLMVerdictSchema
 from app.services.ai_model_router import NVIDIAModelTask, get_model_for_task
@@ -78,6 +84,59 @@ MATCH_TOKEN_ALIASES = {
     "কোরবানি": "sacrifice",
     "কুরবানি": "sacrifice",
 }
+
+LIVE_STAGE_SEQUENCE = (
+    "queued",
+    "extracting_claim",
+    "searching_sources",
+    "comparing_evidence",
+    "generating_verdict",
+)
+LIVE_STAGE_METADATA = {
+    "queued": {
+        "label": "Reading input",
+        "message": "Preparing the incoming submission...",
+        "index": 0,
+        "progress": 10.0,
+    },
+    "extracting_claim": {
+        "label": "Extracting claim",
+        "message": "Normalizing the claim and isolating the factual core...",
+        "index": 1,
+        "progress": 28.0,
+    },
+    "searching_sources": {
+        "label": "Searching trusted sources",
+        "message": "Generating retrieval queries and collecting live evidence...",
+        "index": 2,
+        "progress": 56.0,
+    },
+    "comparing_evidence": {
+        "label": "Comparing evidence",
+        "message": "Ranking sources and measuring support versus contradiction...",
+        "index": 3,
+        "progress": 78.0,
+    },
+    "generating_verdict": {
+        "label": "Generating verdict",
+        "message": "Synthesizing grounded evidence into the final decision...",
+        "index": 4,
+        "progress": 92.0,
+    },
+    "completed": {
+        "label": "Verification complete",
+        "message": "Evidence locked. Preparing your verdict...",
+        "index": 4,
+        "progress": 100.0,
+    },
+    "failed": {
+        "label": "Verification failed",
+        "message": "The verification engine hit an error while processing this claim.",
+        "index": 4,
+        "progress": 100.0,
+    },
+}
+MAX_LIVE_EVENTS = 18
 
 
 # ── Utility helpers ───────────────────────────────────────────────────────────
@@ -253,6 +312,181 @@ def _filter_selected_evidence(evidence: list[dict[str, Any]]) -> list[dict[str, 
         ranked_item["final_rank"] = final_rank
         filtered.append(ranked_item)
     return filtered
+
+
+def _preview_text(value: str | None, *, limit: int = 900) -> str | None:
+    if not value:
+        return None
+    compact = re.sub(r"[ \t]+", " ", str(value)).strip()
+    compact = re.sub(r"\n{3,}", "\n\n", compact)
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _live_stage_payload(stage_key: str, *, message: str | None = None) -> dict[str, Any]:
+    stage = LIVE_STAGE_METADATA.get(stage_key, LIVE_STAGE_METADATA["queued"])
+    return {
+        "stage_key": stage_key,
+        "stage_label": stage["label"],
+        "stage_message": message or stage["message"],
+        "stage_index": stage["index"],
+        "total_stages": len(LIVE_STAGE_SEQUENCE),
+        "progress_percent": stage["progress"],
+    }
+
+
+def _touch_live_status(live_status: dict[str, Any]) -> dict[str, Any]:
+    live_status["updated_at"] = utc_now().isoformat()
+    return live_status
+
+
+def _set_live_stage(
+    live_status: dict[str, Any],
+    stage_key: str,
+    *,
+    message: str | None = None,
+) -> dict[str, Any]:
+    live_status.update(_live_stage_payload(stage_key, message=message))
+    return _touch_live_status(live_status)
+
+
+def _append_live_event(
+    live_status: dict[str, Any],
+    *,
+    key: str,
+    label: str,
+    status: str,
+    summary: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    events = list(live_status.get("events") or [])
+    events.append(
+        {
+            "key": key,
+            "label": label,
+            "status": status,
+            "summary": summary,
+            "timestamp": utc_now().isoformat(),
+            "metadata": metadata or {},
+        }
+    )
+    live_status["events"] = events[-MAX_LIVE_EVENTS:]
+    return _touch_live_status(live_status)
+
+
+def _merge_live_details(
+    live_status: dict[str, Any],
+    section: str,
+    values: dict[str, Any],
+) -> dict[str, Any]:
+    details = dict(live_status.get("details") or {})
+    current = details.get(section)
+    merged = dict(current) if isinstance(current, dict) else {}
+    merged.update(values)
+    details[section] = merged
+    live_status["details"] = details
+    return _touch_live_status(live_status)
+
+
+def _set_live_warning_messages(
+    live_status: dict[str, Any],
+    warnings: list[str] | tuple[str, ...],
+) -> dict[str, Any]:
+    current = [str(item) for item in live_status.get("warnings") or [] if str(item).strip()]
+    for warning in warnings:
+        normalized = str(warning).strip()
+        if normalized and normalized not in current:
+            current.append(normalized)
+    live_status["warnings"] = current
+    return _touch_live_status(live_status)
+
+
+def _truncate_metadata(value: Any, *, limit: int = 220) -> Any:
+    if isinstance(value, str):
+        return _preview_text(value, limit=limit) or ""
+    if isinstance(value, list):
+        return [_truncate_metadata(item, limit=limit) for item in value[:6]]
+    if isinstance(value, dict):
+        return {str(key): _truncate_metadata(item, limit=limit) for key, item in list(value.items())[:10]}
+    return value
+
+
+def _build_initial_live_status(
+    *,
+    input_type: str,
+    raw_input: str | None = None,
+    source_url: str | None = None,
+    context_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = dict(context_payload or {})
+    ocr_model = metadata.get("ocr_model") or get_model_for_task(NVIDIAModelTask.IMAGE_OCR)
+    live_status: dict[str, Any] = {
+        **_live_stage_payload("queued"),
+        "raw_input": _preview_text(raw_input),
+        "cleaned_input": None,
+        "masked_input": None,
+        "extracted_claim": None,
+        "retrieval_query": None,
+        "detected_language": None,
+        "search_queries": [],
+        "warnings": [],
+        "details": {
+            "input": {
+                "input_type": input_type,
+                "source_url": source_url,
+                "filename": metadata.get("filename"),
+                "content_type": metadata.get("content_type"),
+                "ocr_method": metadata.get("ocr_method"),
+                "ocr_model": ocr_model if input_type == "image" else None,
+                "external_id": metadata.get("external_id"),
+            },
+            "models": {
+                "claim_extraction_model": settings.active_gemini_claim_extraction_model
+                or get_model_for_task(NVIDIAModelTask.CLAIM_EXTRACTION),
+                "reasoning_candidates": settings.active_gemini_reasoning_models
+                or ([get_model_for_task(NVIDIAModelTask.CLAIM_REASONING)] if get_model_for_task(NVIDIAModelTask.CLAIM_REASONING) else []),
+                "search_provider": settings.search_provider,
+                "embedding_model": settings.embedding_model,
+                "backup_gemini_key_count": max(0, len(settings.active_gemini_api_keys) - 1),
+            },
+        },
+        "events": [],
+        "updated_at": utc_now().isoformat(),
+    }
+    if source_url:
+        live_status["raw_input"] = source_url
+    if metadata.get("ocr_warning"):
+        _set_live_warning_messages(live_status, [str(metadata["ocr_warning"])])
+    return _append_live_event(
+        live_status,
+        key="job_queued",
+        label="Job queued",
+        status="running",
+        summary="Verification job created and waiting for engine execution.",
+        metadata={"input_type": input_type},
+    )
+
+
+def _evidence_preview(items: list[dict[str, Any]], *, limit: int = 4) -> list[dict[str, Any]]:
+    previews: list[dict[str, Any]] = []
+    for item in items[:limit]:
+        previews.append(
+            {
+                "source_id": item.get("source_id"),
+                "title": _preview_text(str(item.get("title") or ""), limit=120),
+                "publisher": _preview_text(str(item.get("publisher") or ""), limit=60),
+                "url": item.get("url"),
+                "snippet": _preview_text(str(item.get("snippet") or ""), limit=180),
+                "match_score": item.get("match_score"),
+                "similarity_score": item.get("similarity_score"),
+                "rerank_score": item.get("rerank_score"),
+                "search_score": item.get("search_score"),
+                "trust_score": item.get("trust_score"),
+                "stance": item.get("stance"),
+            }
+        )
+    return previews
 
 
 def _build_reasoning_text(
@@ -523,7 +757,15 @@ def _parse_ai_usage(context_payload: dict[str, Any]) -> AIUsageSchema | None:
 
 # ── Serialization ─────────────────────────────────────────────────────────────
 
-def serialize_job(job: VerificationJob) -> VerificationJobSchema:
+def serialize_job(
+    job: VerificationJob,
+    live_status: dict[str, Any] | VerificationLiveStatusSchema | None = None,
+) -> VerificationJobSchema:
+    parsed_live_status: VerificationLiveStatusSchema | None = None
+    if isinstance(live_status, VerificationLiveStatusSchema):
+        parsed_live_status = live_status
+    elif isinstance(live_status, dict) and live_status:
+        parsed_live_status = VerificationLiveStatusSchema.model_validate(live_status, strict=False)
     return VerificationJobSchema(
         id=job.id,
         claim_id=job.claim_id,
@@ -536,6 +778,7 @@ def serialize_job(job: VerificationJob) -> VerificationJobSchema:
         created_at=job.created_at,
         updated_at=job.updated_at,
         completed_at=job.completed_at,
+        live_status=parsed_live_status,
     )
 
 
@@ -646,12 +889,50 @@ async def _load_claim(session: AsyncSession, claim_id: UUID | str) -> Claim | No
     return await session.scalar(statement)
 
 
-async def _create_job(session: AsyncSession, input_type: str) -> VerificationJob:
-    job = VerificationJob(input_type=input_type, status="processing", cached_hit=False)
+async def _publish_job_status(
+    job: VerificationJob,
+    live_status: dict[str, Any] | VerificationLiveStatusSchema | None = None,
+) -> None:
+    await cache_service.set_job_status(
+        str(job.id),
+        serialize_job(job, live_status=live_status).model_dump(mode="json"),
+    )
+
+
+async def _load_live_status(job_id: UUID | str) -> dict[str, Any] | None:
+    cached = await cache_service.get_job_status(str(job_id))
+    live_status = cached.get("live_status") if isinstance(cached, dict) else None
+    return dict(live_status) if isinstance(live_status, dict) else None
+
+
+async def _create_job(
+    session: AsyncSession,
+    input_type: str,
+    *,
+    status: str = "processing",
+    live_status: dict[str, Any] | None = None,
+) -> VerificationJob:
+    job = VerificationJob(input_type=input_type, status=status, cached_hit=False)
     session.add(job)
     await session.commit()
     await session.refresh(job)
-    await cache_service.set_job_status(str(job.id), serialize_job(job).model_dump(mode="json"))
+    await _publish_job_status(job, live_status=live_status)
+    return job
+
+
+async def _ensure_job_processing(
+    session: AsyncSession,
+    job: VerificationJob,
+    *,
+    live_status: dict[str, Any] | None = None,
+) -> VerificationJob:
+    if job.status != "processing":
+        job.status = "processing"
+        job.error_code = None
+        job.error_message = None
+        await session.commit()
+        await session.refresh(job)
+    await _publish_job_status(job, live_status=live_status)
     return job
 
 
@@ -662,6 +943,7 @@ async def _complete_job(
     claim_id: UUID | None,
     cached_hit: bool,
     status: str = "completed",
+    live_status: dict[str, Any] | None = None,
 ) -> None:
     job.claim_id = claim_id
     job.cached_hit = cached_hit
@@ -669,7 +951,7 @@ async def _complete_job(
     job.completed_at = utc_now()
     await session.commit()
     await session.refresh(job)
-    await cache_service.set_job_status(str(job.id), serialize_job(job).model_dump(mode="json"))
+    await _publish_job_status(job, live_status=live_status)
 
 
 async def _fail_job(
@@ -678,6 +960,7 @@ async def _fail_job(
     *,
     code: str,
     message: str,
+    live_status: dict[str, Any] | None = None,
 ) -> None:
     await session.rollback()
     persisted_job = await session.get(VerificationJob, job.id)
@@ -690,9 +973,7 @@ async def _fail_job(
     persisted_job.completed_at = utc_now()
     await session.commit()
     await session.refresh(persisted_job)
-    await cache_service.set_job_status(
-        str(persisted_job.id), serialize_job(persisted_job).model_dump(mode="json")
-    )
+    await _publish_job_status(persisted_job, live_status=live_status)
 
 
 async def _fetch_url_text(url: str) -> tuple[str, dict[str, Any]]:
@@ -726,15 +1007,20 @@ async def _return_existing_claim(
     claim: Claim,
     *,
     cached_hit: bool,
+    live_status: dict[str, Any] | None = None,
 ) -> ClaimSubmissionResponseSchema:
-    await _complete_job(session, job, claim_id=claim.id, cached_hit=cached_hit)
+    await _complete_job(session, job, claim_id=claim.id, cached_hit=cached_hit, live_status=live_status)
     serialized = serialize_claim(claim)
     await cache_service.set_duplicate_claim_id(claim.normalized_hash, str(claim.id))
     await cache_service.set_claim_result(
         claim.normalized_hash,
         {"claim_id": str(claim.id), "job_id": str(job.id), "cached": cached_hit},
     )
-    return ClaimSubmissionResponseSchema(job=serialize_job(job), claim=serialized, cached=cached_hit)
+    return ClaimSubmissionResponseSchema(
+        job=serialize_job(job, live_status=live_status),
+        claim=serialized,
+        cached=cached_hit,
+    )
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -746,6 +1032,8 @@ async def _pipeline_from_text(
     raw_text: str,
     source_url: str | None = None,
     context_payload: dict[str, Any] | None = None,
+    job: VerificationJob | None = None,
+    live_status: dict[str, Any] | None = None,
 ) -> ClaimSubmissionResponseSchema:
     """
     Full evidence-based claim verification pipeline.
@@ -764,10 +1052,42 @@ async def _pipeline_from_text(
     11. Guardrails
     12. Save + return
     """
-    job = await _create_job(session, input_type=input_type)
+    if job is None:
+        live_status = live_status or _build_initial_live_status(
+            input_type=input_type,
+            raw_input=raw_text,
+            source_url=source_url,
+            context_payload=context_payload,
+        )
+        job = await _create_job(
+            session,
+            input_type=input_type,
+            status="processing",
+            live_status=live_status,
+        )
+    else:
+        live_status = live_status or await _load_live_status(job.id) or _build_initial_live_status(
+            input_type=input_type,
+            raw_input=raw_text,
+            source_url=source_url,
+            context_payload=context_payload,
+        )
+        await _ensure_job_processing(session, job, live_status=live_status)
+
     try:
         pipeline_start = time.perf_counter()
         claim_context = dict(context_payload or {})
+        live_status["raw_input"] = live_status.get("raw_input") or _preview_text(raw_text)
+        _set_live_stage(live_status, "queued")
+        _merge_live_details(
+            live_status,
+            "input",
+            {
+                "input_type": input_type,
+                "source_url": source_url,
+            },
+        )
+        await _publish_job_status(job, live_status)
 
         # ─────────────────────────────────────────────────────────────────────
         # Stage 1: Input normalization
@@ -793,20 +1113,101 @@ async def _pipeline_from_text(
         job.normalized_hash = hash_value
         await session.commit()
         await session.refresh(job)
-        await cache_service.set_job_status(str(job.id), serialize_job(job).model_dump(mode="json"))
+        live_status["cleaned_input"] = _preview_text(cleaned_text)
+        live_status["masked_input"] = _preview_text(masked_text)
+        live_status["detected_language"] = language
+        _merge_live_details(
+            live_status,
+            "input",
+            {
+                "language": language,
+                "normalized_hash": hash_value,
+                "content_hash": content_hash,
+                "verification_pipeline_version": settings.verification_pipeline_version,
+            },
+        )
+        _append_live_event(
+            live_status,
+            key="input_normalized",
+            label="Input normalized",
+            status="completed",
+            summary=f"Detected {language} input and generated a normalized verification hash.",
+            metadata={"language": language, "normalized_hash": hash_value[:12]},
+        )
+        await _publish_job_status(job, live_status)
 
         # ── Cache / dedup check ───────────────────────────────────────────────
         duplicate_claim_id = await cache_service.get_duplicate_claim_id(hash_value)
         if duplicate_claim_id:
             existing = await _load_claim(session, duplicate_claim_id)
             if existing:
-                return await _return_existing_claim(session, job, existing, cached_hit=True)
+                serialized_existing = serialize_claim(existing)
+                _append_live_event(
+                    live_status,
+                    key="cache_hit",
+                    label="Cache hit",
+                    status="cached",
+                    summary="Matched a previously verified claim and reused the stored verdict.",
+                    metadata={"claim_id": str(existing.id)},
+                )
+                live_status["extracted_claim"] = serialized_existing.extracted_claim
+                live_status["retrieval_query"] = serialized_existing.extracted_claim
+                live_status["detected_language"] = serialized_existing.detected_language
+                _merge_live_details(
+                    live_status,
+                    "verdict",
+                    {
+                        "cached_hit": True,
+                        "verdict": serialized_existing.verdict,
+                        "confidence": serialized_existing.confidence,
+                        "confidence_label": serialized_existing.confidence_label,
+                        "summary": serialized_existing.user_response,
+                    },
+                )
+                _set_live_stage(live_status, "completed", message="Matched a previously verified claim.")
+                return await _return_existing_claim(
+                    session,
+                    job,
+                    existing,
+                    cached_hit=True,
+                    live_status=live_status,
+                )
 
         cached_payload = await cache_service.get_claim_result(hash_value)
         if cached_payload and cached_payload.get("claim_id"):
             existing = await _load_claim(session, cached_payload["claim_id"])
             if existing:
-                return await _return_existing_claim(session, job, existing, cached_hit=True)
+                serialized_existing = serialize_claim(existing)
+                _append_live_event(
+                    live_status,
+                    key="result_cache_hit",
+                    label="Result cache hit",
+                    status="cached",
+                    summary="Loaded a previously generated verdict from the claim-result cache.",
+                    metadata={"claim_id": str(existing.id)},
+                )
+                live_status["extracted_claim"] = serialized_existing.extracted_claim
+                live_status["retrieval_query"] = serialized_existing.extracted_claim
+                live_status["detected_language"] = serialized_existing.detected_language
+                _merge_live_details(
+                    live_status,
+                    "verdict",
+                    {
+                        "cached_hit": True,
+                        "verdict": serialized_existing.verdict,
+                        "confidence": serialized_existing.confidence,
+                        "confidence_label": serialized_existing.confidence_label,
+                        "summary": serialized_existing.user_response,
+                    },
+                )
+                _set_live_stage(live_status, "completed", message="Loaded a previous verification result from cache.")
+                return await _return_existing_claim(
+                    session,
+                    job,
+                    existing,
+                    cached_hit=True,
+                    live_status=live_status,
+                )
 
         existing_db_claim = await session.scalar(
             select(Claim.id).where(Claim.normalized_hash == hash_value).limit(1)
@@ -814,7 +1215,37 @@ async def _pipeline_from_text(
         if existing_db_claim:
             existing = await _load_claim(session, existing_db_claim)
             if existing:
-                return await _return_existing_claim(session, job, existing, cached_hit=True)
+                serialized_existing = serialize_claim(existing)
+                _append_live_event(
+                    live_status,
+                    key="database_match",
+                    label="Existing verification reused",
+                    status="cached",
+                    summary="Found an existing verified claim in the database and reused its result.",
+                    metadata={"claim_id": str(existing.id)},
+                )
+                live_status["extracted_claim"] = serialized_existing.extracted_claim
+                live_status["retrieval_query"] = serialized_existing.extracted_claim
+                live_status["detected_language"] = serialized_existing.detected_language
+                _merge_live_details(
+                    live_status,
+                    "verdict",
+                    {
+                        "cached_hit": True,
+                        "verdict": serialized_existing.verdict,
+                        "confidence": serialized_existing.confidence,
+                        "confidence_label": serialized_existing.confidence_label,
+                        "summary": serialized_existing.user_response,
+                    },
+                )
+                _set_live_stage(live_status, "completed", message="Found an existing verification in the database.")
+                return await _return_existing_claim(
+                    session,
+                    job,
+                    existing,
+                    cached_hit=True,
+                    live_status=live_status,
+                )
 
         if not await cache_service.reserve_uncached_claim_slot():
             raise AppError(
@@ -822,6 +1253,9 @@ async def _pipeline_from_text(
                 code="AI_RATE_LIMITED",
                 message="Verification is busy right now. Please try again shortly.",
             )
+
+        _set_live_stage(live_status, "extracting_claim")
+        await _publish_job_status(job, live_status)
 
         # ─────────────────────────────────────────────────────────────────────
         # Stage 2: Claim extraction
@@ -841,6 +1275,38 @@ async def _pipeline_from_text(
             retrieval_query, extraction.category,
             len(extraction.entities), extraction.requires_freshness,
         )
+        live_status["extracted_claim"] = _preview_text(extraction.extracted_claim)
+        live_status["retrieval_query"] = _preview_text(retrieval_query)
+        live_status["detected_language"] = extraction.detected_language or language
+        _merge_live_details(
+            live_status,
+            "extraction",
+            {
+                "category": extraction.category,
+                "entities": extraction.entities,
+                "time_context": extraction.time_context,
+                "location_context": extraction.location_context,
+                "requires_freshness": extraction.requires_freshness,
+                "verification_strategy": extraction.verification_strategy,
+                "model": extraction_metadata.get("model"),
+                "provider": extraction_metadata.get("provider"),
+                "cached": extraction_metadata.get("cached", False),
+            },
+        )
+        _append_live_event(
+            live_status,
+            key="claim_extracted",
+            label="Claim extracted",
+            status="completed",
+            summary="Captured the factual claim and translated it into a normalized verification target.",
+            metadata={
+                "category": extraction.category,
+                "language": extraction.detected_language or language,
+                "entity_count": len(extraction.entities),
+            },
+        )
+        _set_live_stage(live_status, "searching_sources")
+        await _publish_job_status(job, live_status)
 
         # ─────────────────────────────────────────────────────────────────────
         # Stage 3: Query generation
@@ -858,6 +1324,26 @@ async def _pipeline_from_text(
             len(flat_queries),
             flat_queries[:3],
         )
+        live_status["search_queries"] = [str(query) for query in flat_queries[:8]]
+        _merge_live_details(
+            live_status,
+            "retrieval",
+            {
+                "query_count": len(flat_queries),
+                "search_queries": [str(query) for query in flat_queries[:8]],
+                "query_model": query_metadata.get("model"),
+                "query_cached": query_metadata.get("cached", False),
+            },
+        )
+        _append_live_event(
+            live_status,
+            key="queries_generated",
+            label="Search queries generated",
+            status="completed",
+            summary=f"Built {len(flat_queries)} retrieval quer{'y' if len(flat_queries) == 1 else 'ies'} for evidence search.",
+            metadata={"query_count": len(flat_queries)},
+        )
+        await _publish_job_status(job, live_status)
 
         # ─────────────────────────────────────────────────────────────────────
         # Stage 4: Tavily search + evidence fetching
@@ -883,6 +1369,34 @@ async def _pipeline_from_text(
             live_evidence.get("tavily_result_count", 0) - len(evidence_documents),
             len(pipeline_warnings),
         )
+        _set_live_warning_messages(live_status, pipeline_warnings)
+        _merge_live_details(
+            live_status,
+            "retrieval",
+            {
+                "tavily_result_count": int(live_evidence.get("tavily_result_count", 0)),
+                "fetched_document_count": len(evidence_documents),
+                "failed_fetch_count": max(
+                    0,
+                    int(live_evidence.get("tavily_result_count", 0)) - len(evidence_documents),
+                ),
+                "tavily_request_count": int(live_evidence.get("tavily_request_count", 0)),
+                "search_answer_context": _truncate_metadata(live_evidence.get("search_answer_context")),
+                "top_sources": _evidence_preview(evidence_documents),
+            },
+        )
+        _append_live_event(
+            live_status,
+            key="live_search_complete",
+            label="Live retrieval complete",
+            status="completed",
+            summary=f"Collected {len(evidence_documents)} live document(s) from Tavily and trusted sources.",
+            metadata={
+                "tavily_results": int(live_evidence.get("tavily_result_count", 0)),
+                "documents": len(evidence_documents),
+            },
+        )
+        await _publish_job_status(job, live_status)
 
         # ─────────────────────────────────────────────────────────────────────
         # Stage 5: Evidence chunking
@@ -894,6 +1408,23 @@ async def _pipeline_from_text(
             (time.perf_counter() - stage_start) * 1000,
             len(evidence_chunks),
         )
+        _merge_live_details(
+            live_status,
+            "retrieval",
+            {
+                "chunk_count": len(evidence_chunks),
+            },
+        )
+        _append_live_event(
+            live_status,
+            key="evidence_chunked",
+            label="Evidence chunked",
+            status="completed",
+            summary=f"Split retrieved documents into {len(evidence_chunks)} comparison-ready evidence chunk(s).",
+            metadata={"chunk_count": len(evidence_chunks)},
+        )
+        _set_live_stage(live_status, "comparing_evidence")
+        await _publish_job_status(job, live_status)
 
         # ─────────────────────────────────────────────────────────────────────
         # Stage 6: Evidence ranking / reranking
@@ -913,6 +1444,27 @@ async def _pipeline_from_text(
             len(ranked_chunks),
             chunk_rerank_metadata.get("applied"),
         )
+        _merge_live_details(
+            live_status,
+            "comparison",
+            {
+                "ranked_chunk_count": len(ranked_chunks),
+                "chunk_rerank_applied": bool(chunk_rerank_metadata.get("applied")),
+                "top_ranked_chunks": _evidence_preview(ranked_chunks),
+            },
+        )
+        _append_live_event(
+            live_status,
+            key="evidence_ranked",
+            label="Evidence ranked",
+            status="completed",
+            summary=f"Ranked {len(ranked_chunks)} chunk(s) by relevance to the extracted claim.",
+            metadata={
+                "ranked_chunks": len(ranked_chunks),
+                "rerank_applied": bool(chunk_rerank_metadata.get("applied")),
+            },
+        )
+        await _publish_job_status(job, live_status)
 
         # ─────────────────────────────────────────────────────────────────────
         # Stage 7: Source credibility scoring
@@ -937,6 +1489,23 @@ async def _pipeline_from_text(
             (time.perf_counter() - stage_start) * 1000,
             len(credibility_scores),
         )
+        _merge_live_details(
+            live_status,
+            "comparison",
+            {
+                "credibility_scores": _truncate_metadata(credibility_scores),
+                "source_count_scored": len(credibility_scores),
+            },
+        )
+        _append_live_event(
+            live_status,
+            key="credibility_scored",
+            label="Source credibility scored",
+            status="completed",
+            summary=f"Scored trust signals for {len(credibility_scores)} source(s).",
+            metadata={"source_count": len(credibility_scores)},
+        )
+        await _publish_job_status(job, live_status)
 
         # ─────────────────────────────────────────────────────────────────────
         # Stage 8: Stance classification
@@ -959,6 +1528,33 @@ async def _pipeline_from_text(
             refutes_count,
             len(classified_chunks) - supports_count - refutes_count,
         )
+        _merge_live_details(
+            live_status,
+            "comparison",
+            {
+                "classified_chunk_count": len(classified_chunks),
+                "supports_count": supports_count,
+                "refutes_count": refutes_count,
+                "neutral_count": len(classified_chunks) - supports_count - refutes_count,
+                "classified_chunks": _truncate_metadata(classified_chunks),
+            },
+        )
+        _append_live_event(
+            live_status,
+            key="stances_classified",
+            label="Evidence stance classified",
+            status="completed",
+            summary=(
+                f"Compared the strongest chunks: {supports_count} support, {refutes_count} refute, "
+                f"{len(classified_chunks) - supports_count - refutes_count} neutral."
+            ),
+            metadata={
+                "supports": supports_count,
+                "refutes": refutes_count,
+                "neutral": len(classified_chunks) - supports_count - refutes_count,
+            },
+        )
+        await _publish_job_status(job, live_status)
 
         # ─────────────────────────────────────────────────────────────────────
         # Stage 9: pgvector retrieval (legacy path — runs in parallel with live evidence)
@@ -989,6 +1585,40 @@ async def _pipeline_from_text(
             len(selected_evidence),
             rerank_metadata.get("applied"),
         )
+        _merge_live_details(
+            live_status,
+            "retrieval",
+            {
+                "pgvector_ready": evidence_index.ready,
+                "index_sources": evidence_index.real_sources,
+                "pgvector_candidates": len(retrieved_candidates),
+                "selected_evidence_count": len(selected_evidence),
+                "selected_evidence": _evidence_preview(selected_evidence),
+            },
+        )
+        _merge_live_details(
+            live_status,
+            "comparison",
+            {
+                "selected_evidence_count": len(selected_evidence),
+                "selected_evidence": _evidence_preview(selected_evidence),
+                "rerank_model": rerank_metadata.get("model"),
+                "rerank_applied": bool(rerank_metadata.get("applied")),
+            },
+        )
+        _append_live_event(
+            live_status,
+            key="vector_retrieval_complete",
+            label="Vector retrieval complete",
+            status="completed",
+            summary=f"Selected {len(selected_evidence)} final evidence source(s) for verdict generation.",
+            metadata={
+                "candidates": len(retrieved_candidates),
+                "selected": len(selected_evidence),
+            },
+        )
+        _set_live_stage(live_status, "generating_verdict")
+        await _publish_job_status(job, live_status)
 
         # ─────────────────────────────────────────────────────────────────────
         # Stage 10: Final verdict generation
@@ -1016,10 +1646,38 @@ async def _pipeline_from_text(
             verdict.verdict, pipeline_verdict,
             verdict.confidence, len(getattr(verdict, "warnings", [])),
         )
+        _set_live_warning_messages(live_status, list(getattr(verdict, "warnings", [])))
+        _merge_live_details(
+            live_status,
+            "verdict",
+            {
+                "verdict": verdict.verdict,
+                "pipeline_verdict": pipeline_verdict,
+                "confidence": verdict.confidence,
+                "confidence_label": verdict.confidence_label,
+                "explanation": _preview_text(verdict.explanation, limit=260),
+                "user_response": _preview_text(verdict.user_response, limit=260),
+                "used_source_ids": [str(source_id) for source_id in verdict.used_source_ids],
+            },
+        )
+        _append_live_event(
+            live_status,
+            key="verdict_generated",
+            label="Verdict generated",
+            status="completed",
+            summary=f"Drafted a {verdict.verdict} verdict with {verdict.confidence_label.lower()} confidence.",
+            metadata={
+                "verdict": verdict.verdict,
+                "confidence": verdict.confidence,
+                "confidence_label": verdict.confidence_label,
+            },
+        )
+        await _publish_job_status(job, live_status)
 
         # ─────────────────────────────────────────────────────────────────────
         # Stage 11: Build AI usage payload
         # ─────────────────────────────────────────────────────────────────────
+        reasoning_provider = llm_metadata.get("provider") or "nvidia"
         reasoning_model = llm_metadata.get("model") or get_model_for_task(NVIDIAModelTask.CLAIM_REASONING)
         claim_extraction_model = (
             extraction_metadata.get("model") or get_model_for_task(NVIDIAModelTask.CLAIM_EXTRACTION)
@@ -1049,6 +1707,27 @@ async def _pipeline_from_text(
             vision_call_count=1 if claim_context.get("ocr_method") == "kimi_ocr" else 0,
             tavily_request_count=int(live_evidence.get("tavily_request_count", 0)),
         )
+        _merge_live_details(
+            live_status,
+            "models",
+            {
+                "claim_extraction_model": claim_extraction_model,
+                "query_generation_model": query_generation_model,
+                "reasoning_provider": reasoning_provider,
+                "reasoning_model_used": reasoning_model,
+                "reasoning_candidates": settings.active_gemini_reasoning_models
+                or ([get_model_for_task(NVIDIAModelTask.CLAIM_REASONING)] if get_model_for_task(NVIDIAModelTask.CLAIM_REASONING) else []),
+                "reasoning_fallback_used": bool(
+                    settings.active_gemini_reasoning_models
+                    and reasoning_model
+                    and reasoning_model != settings.active_gemini_reasoning_models[0]
+                ),
+                "rerank_model": rerank_model,
+                "vision_model": vision_model,
+                "embedding_model": settings.embedding_model,
+            },
+        )
+        await _publish_job_status(job, live_status)
 
         claim_context.update({
             "extracted_claim": verdict.extracted_claim,
@@ -1061,7 +1740,9 @@ async def _pipeline_from_text(
             "pipeline_warnings": pipeline_warnings + list(getattr(verdict, "warnings", [])),
             "claim_extraction_model": claim_extraction_model,
             "query_generation_model": query_generation_model,
-            "nvidia_reasoning_model": reasoning_model,
+            "reasoning_provider": reasoning_provider,
+            "reasoning_model": reasoning_model,
+            "nvidia_reasoning_model": reasoning_model if reasoning_provider == "nvidia" else None,
             "claim_extraction": {
                 "query_used_for_retrieval": retrieval_query,
                 "entities": extraction.entities,
@@ -1144,6 +1825,15 @@ async def _pipeline_from_text(
         )
         session.add(claim)
         await session.flush()
+        _append_live_event(
+            live_status,
+            key="claim_persisted",
+            label="Verification persisted",
+            status="completed",
+            summary="Stored the verified claim, evidence links, and reasoning trace.",
+            metadata={"claim_id": str(claim.id)},
+        )
+        await _publish_job_status(job, live_status)
 
         if cluster.representative_claim_id is None:
             cluster.representative_claim_id = claim.id
@@ -1203,7 +1893,29 @@ async def _pipeline_from_text(
         if persisted_claim is None:
             raise AppError(status_code=500, code="CLAIM_SAVE_FAILED", message="Claim could not be reloaded.")
 
-        await _complete_job(session, job, claim_id=persisted_claim.id, cached_hit=False)
+        live_status["extracted_claim"] = _preview_text(verdict.extracted_claim)
+        live_status["retrieval_query"] = _preview_text(retrieval_query)
+        live_status["detected_language"] = verdict.detected_language
+        _merge_live_details(
+            live_status,
+            "verdict",
+            {
+                "claim_id": str(persisted_claim.id),
+                "cached_hit": False,
+                "verdict": verdict.verdict,
+                "confidence": verdict.confidence,
+                "confidence_label": verdict.confidence_label,
+                "summary": _preview_text(verdict.user_response, limit=260),
+            },
+        )
+        _set_live_stage(live_status, "completed")
+        await _complete_job(
+            session,
+            job,
+            claim_id=persisted_claim.id,
+            cached_hit=False,
+            live_status=live_status,
+        )
         await cache_service.set_duplicate_claim_id(hash_value, str(persisted_claim.id))
         await cache_service.set_claim_result(
             hash_value,
@@ -1219,19 +1931,42 @@ async def _pipeline_from_text(
             len(classified_chunks), len(pipeline_warnings),
         )
         return ClaimSubmissionResponseSchema(
-            job=serialize_job(job),
+            job=serialize_job(job, live_status=live_status),
             claim=serialize_claim(persisted_claim),
             cached=False,
         )
     except AppError as exc:
-        await _fail_job(session, job, code=exc.code, message=exc.message)
+        _set_live_stage(live_status, "failed", message=exc.message)
+        _append_live_event(
+            live_status,
+            key="verification_failed",
+            label="Verification failed",
+            status="failed",
+            summary=exc.message,
+            metadata={"error_code": exc.code},
+        )
+        await _fail_job(session, job, code=exc.code, message=exc.message, live_status=live_status)
         raise
     except Exception:
+        _set_live_stage(
+            live_status,
+            "failed",
+            message="Claim verification pipeline failed unexpectedly.",
+        )
+        _append_live_event(
+            live_status,
+            key="verification_failed",
+            label="Verification failed",
+            status="failed",
+            summary="Claim verification pipeline failed unexpectedly.",
+            metadata={"error_code": "PIPELINE_FAILED"},
+        )
         await _fail_job(
             session,
             job,
             code="PIPELINE_FAILED",
             message="Claim verification pipeline failed unexpectedly.",
+            live_status=live_status,
         )
         raise
 
@@ -1308,6 +2043,318 @@ async def process_image_claim(
     )
 
 
+async def enqueue_text_claim(
+    session: AsyncSession,
+    text: str,
+    external_id: str | None = None,
+) -> ClaimSubmissionResponseSchema:
+    context = {"external_id": external_id} if external_id else {}
+    live_status = _build_initial_live_status(
+        input_type="text",
+        raw_input=text,
+        context_payload=context,
+    )
+    job = await _create_job(session, input_type="text", status="queued", live_status=live_status)
+    return ClaimSubmissionResponseSchema(
+        job=serialize_job(job, live_status=live_status),
+        claim=None,
+        cached=False,
+    )
+
+
+async def enqueue_url_claim(
+    session: AsyncSession,
+    url: str,
+    external_id: str | None = None,
+) -> ClaimSubmissionResponseSchema:
+    context: dict[str, Any] = {"source_url": url}
+    if external_id:
+        context["external_id"] = external_id
+    live_status = _build_initial_live_status(
+        input_type="url",
+        raw_input=url,
+        source_url=url,
+        context_payload=context,
+    )
+    job = await _create_job(session, input_type="url", status="queued", live_status=live_status)
+    return ClaimSubmissionResponseSchema(
+        job=serialize_job(job, live_status=live_status),
+        claim=None,
+        cached=False,
+    )
+
+
+async def enqueue_image_claim(
+    session: AsyncSession,
+    *,
+    filename: str | None = None,
+    content_type: str | None = None,
+    external_id: str | None = None,
+) -> ClaimSubmissionResponseSchema:
+    metadata: dict[str, Any] = {
+        "filename": filename,
+        "content_type": content_type,
+        "ocr_method": "kimi_ocr",
+        "ocr_model": get_model_for_task(NVIDIAModelTask.IMAGE_OCR),
+        "ocr_warning": "Input extracted via OCR - text may contain noise or errors.",
+    }
+    if external_id:
+        metadata["external_id"] = external_id
+    live_status = _build_initial_live_status(
+        input_type="image",
+        context_payload=metadata,
+    )
+    job = await _create_job(session, input_type="image", status="queued", live_status=live_status)
+    return ClaimSubmissionResponseSchema(
+        job=serialize_job(job, live_status=live_status),
+        claim=None,
+        cached=False,
+    )
+
+
+async def _get_job_for_execution(session: AsyncSession, job_id: UUID | str) -> VerificationJob:
+    parsed_id = _parse_uuid(job_id, code="INVALID_JOB_ID", message="Verification job ID must be a valid UUID.")
+    job = await session.get(VerificationJob, parsed_id)
+    if job is None:
+        raise AppError(status_code=404, code="JOB_NOT_FOUND", message="Verification job not found.")
+    return job
+
+
+async def run_text_claim_job(
+    job_id: UUID | str,
+    *,
+    text: str,
+    external_id: str | None = None,
+) -> None:
+    async with SessionLocal() as session:
+        job = await _get_job_for_execution(session, job_id)
+        context = {"external_id": external_id} if external_id else {}
+        try:
+            await _pipeline_from_text(
+                session,
+                input_type="text",
+                raw_text=text,
+                context_payload=context,
+                job=job,
+                live_status=await _load_live_status(job.id),
+            )
+        except AppError:
+            logger.info("verification_job_text_failed job_id=%s", job_id)
+        except Exception:
+            logger.exception("verification_job_text_failed job_id=%s", job_id)
+
+
+async def run_url_claim_job(
+    job_id: UUID | str,
+    *,
+    url: str,
+    external_id: str | None = None,
+) -> None:
+    async with SessionLocal() as session:
+        job = await _get_job_for_execution(session, job_id)
+        live_status = await _load_live_status(job.id) or _build_initial_live_status(
+            input_type="url",
+            raw_input=url,
+            source_url=url,
+            context_payload={"source_url": url},
+        )
+        try:
+            await _ensure_job_processing(session, job, live_status=live_status)
+            _set_live_stage(live_status, "queued", message="Fetching text from the submitted URL...")
+            _append_live_event(
+                live_status,
+                key="url_fetch_started",
+                label="URL fetch started",
+                status="running",
+                summary="Downloading and extracting article text from the submitted URL.",
+                metadata={"url": url},
+            )
+            await _publish_job_status(job, live_status)
+            text, metadata = await _fetch_url_text(url)
+            if external_id:
+                metadata["external_id"] = external_id
+            _append_live_event(
+                live_status,
+                key="url_fetch_complete",
+                label="URL fetch complete",
+                status="completed",
+                summary="Fetched page content and prepared it for claim extraction.",
+                metadata={"fetched_url": metadata.get("fetched_url"), "status_code": metadata.get("status_code")},
+            )
+            _merge_live_details(
+                live_status,
+                "input",
+                {
+                    "source_url": url,
+                    "fetched_url": metadata.get("fetched_url"),
+                    "status_code": metadata.get("status_code"),
+                },
+            )
+            live_status["raw_input"] = _preview_text(text)
+        except AppError as exc:
+            _set_live_stage(live_status, "failed", message=exc.message)
+            _append_live_event(
+                live_status,
+                key="url_fetch_failed",
+                label="URL fetch failed",
+                status="failed",
+                summary=exc.message,
+                metadata={"error_code": exc.code},
+            )
+            await _fail_job(session, job, code=exc.code, message=exc.message, live_status=live_status)
+            return
+        except Exception:
+            logger.exception("verification_job_url_failed job_id=%s", job_id)
+            _set_live_stage(live_status, "failed", message="Claim verification pipeline failed unexpectedly.")
+            _append_live_event(
+                live_status,
+                key="url_fetch_failed",
+                label="URL verification failed",
+                status="failed",
+                summary="Claim verification pipeline failed unexpectedly.",
+                metadata={"error_code": "PIPELINE_FAILED"},
+            )
+            await _fail_job(
+                session,
+                job,
+                code="PIPELINE_FAILED",
+                message="Claim verification pipeline failed unexpectedly.",
+                live_status=live_status,
+            )
+            return
+
+        try:
+            await _pipeline_from_text(
+                session,
+                input_type="url",
+                raw_text=text,
+                source_url=url,
+                context_payload=metadata,
+                job=job,
+                live_status=live_status,
+            )
+        except AppError:
+            logger.info("verification_job_url_failed job_id=%s", job_id)
+        except Exception:
+            logger.exception("verification_job_url_failed job_id=%s", job_id)
+
+
+async def run_image_claim_job(
+    job_id: UUID | str,
+    *,
+    image_bytes: bytes,
+    filename: str | None = None,
+    content_type: str | None = None,
+    external_id: str | None = None,
+) -> None:
+    async with SessionLocal() as session:
+        job = await _get_job_for_execution(session, job_id)
+        live_status = await _load_live_status(job.id) or _build_initial_live_status(
+            input_type="image",
+            context_payload={
+                "filename": filename,
+                "content_type": content_type,
+                "ocr_method": "kimi_ocr",
+                "ocr_model": get_model_for_task(NVIDIAModelTask.IMAGE_OCR),
+            },
+        )
+        try:
+            await _ensure_job_processing(session, job, live_status=live_status)
+            _set_live_stage(live_status, "queued", message="Extracting text from the uploaded image...")
+            _append_live_event(
+                live_status,
+                key="ocr_started",
+                label="OCR started",
+                status="running",
+                summary="Running Kimi OCR to isolate claim-like text from the uploaded image.",
+                metadata={"filename": filename, "content_type": content_type},
+            )
+            await _publish_job_status(job, live_status)
+            ocr_text = await extract_text_from_image(image_bytes, mime_type=content_type)
+            text = prepare_ocr_text_for_claim_extraction(ocr_text)
+            if len(clean_text(text)) < 5:
+                text = clean_text(ocr_text)
+            metadata: dict[str, Any] = {
+                "ocr_method": "kimi_ocr",
+                "ocr_model": get_model_for_task(NVIDIAModelTask.IMAGE_OCR),
+                "ocr_warning": "Input extracted via OCR - text may contain noise or errors.",
+                "ocr_line_count": len([line for line in ocr_text.splitlines() if clean_text(line)]),
+                "ocr_text_compacted": text != clean_text(ocr_text),
+                "filename": filename,
+                "content_type": content_type,
+            }
+            if external_id:
+                metadata["external_id"] = external_id
+            live_status["raw_input"] = _preview_text(text)
+            _merge_live_details(
+                live_status,
+                "input",
+                {
+                    "filename": filename,
+                    "content_type": content_type,
+                    "ocr_line_count": metadata["ocr_line_count"],
+                    "ocr_text_compacted": metadata["ocr_text_compacted"],
+                },
+            )
+            _set_live_warning_messages(live_status, [str(metadata["ocr_warning"])])
+            _append_live_event(
+                live_status,
+                key="ocr_complete",
+                label="OCR complete",
+                status="completed",
+                summary="Extracted the main image text and prepared it for claim verification.",
+                metadata={
+                    "ocr_line_count": metadata["ocr_line_count"],
+                    "ocr_text_compacted": metadata["ocr_text_compacted"],
+                },
+            )
+        except AppError as exc:
+            _set_live_stage(live_status, "failed", message=exc.message)
+            _append_live_event(
+                live_status,
+                key="ocr_failed",
+                label="OCR failed",
+                status="failed",
+                summary=exc.message,
+                metadata={"error_code": exc.code},
+            )
+            await _fail_job(session, job, code=exc.code, message=exc.message, live_status=live_status)
+            return
+        except Exception:
+            logger.exception("verification_job_image_failed job_id=%s", job_id)
+            _set_live_stage(live_status, "failed", message="Claim verification pipeline failed unexpectedly.")
+            _append_live_event(
+                live_status,
+                key="ocr_failed",
+                label="Image verification failed",
+                status="failed",
+                summary="Claim verification pipeline failed unexpectedly.",
+                metadata={"error_code": "PIPELINE_FAILED"},
+            )
+            await _fail_job(
+                session,
+                job,
+                code="PIPELINE_FAILED",
+                message="Claim verification pipeline failed unexpectedly.",
+                live_status=live_status,
+            )
+            return
+
+        try:
+            await _pipeline_from_text(
+                session,
+                input_type="image",
+                raw_text=text,
+                context_payload=metadata,
+                job=job,
+                live_status=live_status,
+            )
+        except AppError:
+            logger.info("verification_job_image_failed job_id=%s", job_id)
+        except Exception:
+            logger.exception("verification_job_image_failed job_id=%s", job_id)
+
+
 # ── Read-only pipeline operations ─────────────────────────────────────────────
 
 async def get_claim_by_id(session: AsyncSession, claim_id: UUID | str) -> ClaimResponseSchema | None:
@@ -1380,8 +2427,44 @@ async def get_verification_job(
     job_id: UUID | str,
 ) -> VerificationJobSchema | None:
     parsed_id = _parse_uuid(job_id, code="INVALID_JOB_ID", message="Job ID must be a valid UUID.")
+    cached = await cache_service.get_job_status(str(job_id))
     job = await session.get(VerificationJob, parsed_id)
     if job is not None:
-        return serialize_job(job)
-    cached = await cache_service.get_job_status(str(job_id))
-    return VerificationJobSchema.model_validate(cached, strict=False) if cached else None
+        base_payload = serialize_job(job).model_dump(mode="json")
+        if isinstance(cached, dict):
+            cached_updated_at = str(cached.get("updated_at") or "")
+            base_updated_at = str(base_payload.get("updated_at") or "")
+            if cached_updated_at and cached_updated_at >= base_updated_at:
+                for key in (
+                    "claim_id",
+                    "status",
+                    "normalized_hash",
+                    "cached_hit",
+                    "error_code",
+                    "error_message",
+                    "completed_at",
+                ):
+                    if key in cached:
+                        base_payload[key] = cached[key]
+            if "live_status" in cached:
+                base_payload["live_status"] = cached["live_status"]
+        live_status_payload = base_payload.get("live_status")
+        if isinstance(live_status_payload, dict):
+            if base_payload.get("status") == "completed" and live_status_payload.get("stage_key") != "completed":
+                live_status_payload.update(_live_stage_payload("completed"))
+                live_status_payload["updated_at"] = str(base_payload.get("completed_at") or base_payload.get("updated_at"))
+            elif base_payload.get("status") == "failed" and live_status_payload.get("stage_key") != "failed":
+                live_status_payload.update(_live_stage_payload("failed"))
+                live_status_payload["updated_at"] = str(base_payload.get("completed_at") or base_payload.get("updated_at"))
+        return VerificationJobSchema.model_validate(base_payload, strict=False)
+    if isinstance(cached, dict):
+        live_status_payload = cached.get("live_status")
+        if isinstance(live_status_payload, dict):
+            if cached.get("status") == "completed" and live_status_payload.get("stage_key") != "completed":
+                live_status_payload.update(_live_stage_payload("completed"))
+                live_status_payload["updated_at"] = str(cached.get("completed_at") or cached.get("updated_at"))
+            elif cached.get("status") == "failed" and live_status_payload.get("stage_key") != "failed":
+                live_status_payload.update(_live_stage_payload("failed"))
+                live_status_payload["updated_at"] = str(cached.get("completed_at") or cached.get("updated_at"))
+        return VerificationJobSchema.model_validate(cached, strict=False)
+    return None

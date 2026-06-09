@@ -258,6 +258,29 @@ CLAIM_EXTRACTION_RESPONSE_SCHEMA: dict[str, Any] = {
         "detected_claims",
     ],
 }
+REASONING_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string"},
+        "confidence": {"type": "number"},
+        "confidence_label": {"type": "string"},
+        "explanation": {"type": "string"},
+        "user_response": {"type": "string"},
+        "used_source_ids": {"type": "array", "items": {"type": "string"}},
+        "key_evidence_ids": {"type": "array", "items": {"type": "string"}},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "verdict",
+        "confidence",
+        "confidence_label",
+        "explanation",
+        "user_response",
+        "used_source_ids",
+        "key_evidence_ids",
+        "warnings",
+    ],
+}
 
 
 # ── Helper utilities ──────────────────────────────────────────────────────────
@@ -950,26 +973,35 @@ async def generate_verdict(
 ) -> tuple[LLMVerdictSchema, dict[str, Any]]:
     source_ids = [UUID(str(item["source_id"])) for item in evidence if item.get("source_id")]
     valid_source_ids = {str(source_id) for source_id in source_ids}
-    model = get_model_for_task(NVIDIAModelTask.CLAIM_REASONING)
+    use_gemini = settings.gemini_reasoning_enabled is True
+    provider = "gemini" if use_gemini else "nvidia"
+    gemini_models = settings.active_gemini_reasoning_models if use_gemini else []
+    model = gemini_models[0] if gemini_models else get_model_for_task(NVIDIAModelTask.CLAIM_REASONING)
 
     if not evidence:
         return fallback_verdict(
             "JachAI could not find any supporting evidence to verify this claim.",
             [],
             extraction=extraction,
-        ), {"model": model, "call_count": 0}
-    if not settings.nvidia_api_key:
+        ), {"model": model, "provider": provider, "call_count": 0}
+    if use_gemini and not model:
+        return fallback_verdict(
+            "No Gemini reasoning model is configured.",
+            source_ids,
+            extraction=extraction,
+        ), {"model": None, "provider": provider, "call_count": 0}
+    if not use_gemini and not settings.nvidia_api_key:
         return fallback_verdict(
             "NVIDIA API key is not configured.",
             source_ids,
             extraction=extraction,
-        ), {"model": model, "call_count": 0}
+        ), {"model": model, "provider": provider, "call_count": 0}
     if not model:
         return fallback_verdict(
-            "No NVIDIA reasoning model is configured.",
+            "No reasoning model is configured.",
             source_ids,
             extraction=extraction,
-        ), {"model": None, "call_count": 0}
+        ), {"model": None, "provider": provider, "call_count": 0}
 
     evidence_context = build_evidence_context(
         evidence,
@@ -995,15 +1027,38 @@ async def generate_verdict(
     attempted_call = False
     try:
         attempted_call = True
-        content = await _call_llm_with_retry(
-            task=NVIDIAModelTask.CLAIM_REASONING,
-            messages=[
-                {"role": "system", "content": REASONING_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.1,
-            max_tokens=1400,
-        )
+        if use_gemini:
+            content = None
+            last_gemini_error: Exception | None = None
+            for reasoning_model in gemini_models:
+                try:
+                    content = await call_gemini_generate_content(
+                        system_instruction=REASONING_SYSTEM_PROMPT,
+                        user_content=user_prompt,
+                        model=reasoning_model,
+                        response_mime_type="application/json",
+                        response_schema=REASONING_RESPONSE_SCHEMA,
+                        max_output_tokens=1400,
+                        purpose="reasoning",
+                    )
+                    model = reasoning_model
+                    break
+                except Exception as exc:
+                    last_gemini_error = exc
+                    logger.exception("gemini_reasoning_model_failed model=%s", reasoning_model)
+                    continue
+            if content is None:
+                raise last_gemini_error or RuntimeError("Gemini reasoning failed unexpectedly.")
+        else:
+            content = await _call_llm_with_retry(
+                task=NVIDIAModelTask.CLAIM_REASONING,
+                messages=[
+                    {"role": "system", "content": REASONING_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_tokens=1400,
+            )
         payload = load_json_with_repair(content or "{}")
         normalized = _normalize_payload(
             payload,
@@ -1036,15 +1091,15 @@ async def generate_verdict(
             pipeline_verdict=reasoning.pipeline_verdict,
             warnings=reasoning.warnings,
         )
-        return llm_verdict, {"model": model, "call_count": 1}
+        return llm_verdict, {"model": model, "provider": provider, "call_count": 1}
     except Exception:
-        logger.exception("nvidia_reasoning_failed")
+        logger.exception("%s_reasoning_failed", provider)
 
     return fallback_verdict(
         "The verification pipeline could not produce a reliable structured result.",
         source_ids,
         extraction=extraction,
-    ), {"model": model, "call_count": 1 if attempted_call else 0}
+    ), {"model": model, "provider": provider, "call_count": 1 if attempted_call else 0}
 
 
 async def extract_text_with_kimi_ocr(

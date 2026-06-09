@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -19,11 +19,14 @@ from app.schemas.claim_schema import (
     ReviewStatusUpdateRequest,
 )
 from app.services.claim_pipeline import (
+    enqueue_image_claim,
+    enqueue_text_claim,
+    enqueue_url_claim,
     get_claim_by_id,
     list_claims,
-    process_image_claim,
-    process_text_claim,
-    process_url_claim,
+    run_image_claim_job,
+    run_text_claim_job,
+    run_url_claim_job,
     update_review_status,
 )
 from app.utils.errors import AppError
@@ -35,13 +38,22 @@ ALLOWED_IMAGE_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/webp"}
 @router.post("/text", response_model=ClaimSubmissionResponseSchema, dependencies=[Depends(claim_submission_rate_limit)])
 async def submit_text_claim(
     payload: ClaimTextRequest,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db),
 ) -> ClaimSubmissionResponseSchema:
-    return await process_text_claim(session, payload.text, payload.external_id)
+    response = await enqueue_text_claim(session, payload.text, payload.external_id)
+    background_tasks.add_task(
+        run_text_claim_job,
+        response.job.id,
+        text=payload.text,
+        external_id=payload.external_id,
+    )
+    return response
 
 
 @router.post("/image", response_model=ClaimSubmissionResponseSchema, dependencies=[Depends(claim_submission_rate_limit)])
 async def submit_image_claim(
+    background_tasks: BackgroundTasks,
     image: UploadFile = File(...),
     external_id: Annotated[str | None, Form()] = None,
     session: AsyncSession = Depends(get_db),
@@ -60,21 +72,37 @@ async def submit_image_claim(
             code="IMAGE_TOO_LARGE",
             message=f"Image must be {settings.max_image_size_mb} MB or smaller.",
         )
-    return await process_image_claim(
+    response = await enqueue_image_claim(
         session,
-        image_bytes,
         filename=image.filename,
         content_type=image.content_type,
         external_id=external_id,
     )
+    background_tasks.add_task(
+        run_image_claim_job,
+        response.job.id,
+        image_bytes=image_bytes,
+        filename=image.filename,
+        content_type=image.content_type,
+        external_id=external_id,
+    )
+    return response
 
 
 @router.post("/url", response_model=ClaimSubmissionResponseSchema, dependencies=[Depends(claim_submission_rate_limit)])
 async def submit_url_claim(
     payload: ClaimURLRequest,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db),
 ) -> ClaimSubmissionResponseSchema:
-    return await process_url_claim(session, str(payload.url), payload.external_id)
+    response = await enqueue_url_claim(session, str(payload.url), payload.external_id)
+    background_tasks.add_task(
+        run_url_claim_job,
+        response.job.id,
+        url=str(payload.url),
+        external_id=payload.external_id,
+    )
+    return response
 
 
 @router.get("/{claim_id}", response_model=ClaimLookupResponseSchema)

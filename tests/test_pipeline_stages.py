@@ -288,6 +288,61 @@ class TestClaimExtraction:
         assert "Input source:\nimage_ocr" in mock_gemini.await_args.kwargs["user_content"]
 
 
+class TestGeminiFailover:
+    @pytest.mark.asyncio
+    async def test_gemini_generate_content_fails_over_to_backup_key_on_429(self):
+        from app.services.gemini_client import call_gemini_generate_content
+        import httpx
+
+        class _FakeClient:
+            def __init__(self, responses):
+                self._responses = responses
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json, headers):
+                response = self._responses.pop(0)
+                response.request = httpx.Request("POST", url, headers=headers)
+                return response
+
+        responses = [
+            httpx.Response(429, json={"error": {"message": "Rate limit exceeded"}}),
+            httpx.Response(
+                200,
+                json={
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [{"text": "{\"ok\": true}"}],
+                            }
+                        }
+                    ]
+                },
+            ),
+        ]
+
+        with patch("app.services.gemini_client.settings") as mock_settings:
+            mock_settings.active_gemini_api_keys = ["primary-key", "backup-key"]
+            mock_settings.gemini_timeout_seconds = 60
+            with patch(
+                "app.services.gemini_client.httpx.AsyncClient",
+                return_value=_FakeClient(responses),
+            ):
+                result = await call_gemini_generate_content(
+                    system_instruction="Return JSON only",
+                    user_content="Reply with {\"ok\": true}",
+                    model="gemini-3.1-flash-lite",
+                    response_mime_type="application/json",
+                    purpose="claim_extraction",
+                )
+
+        assert result == "{\"ok\": true}"
+
+
 # ── 3. Query generation ───────────────────────────────────────────────────────
 
 class TestQueryGeneration:
@@ -584,6 +639,102 @@ class TestStanceClassification:
                 result = await classify_evidence_stance(chunk, normalized_claim="WHO confirmed an event in 2024")
                 assert result["stance"] == "supports"
                 assert result["stance_confidence"] >= 0.8
+
+
+class TestVerdictGeneration:
+    @pytest.mark.asyncio
+    async def test_generate_verdict_prefers_gemini_reasoning_when_configured(self):
+        from app.schemas.verdict_schema import ClaimExtractionSchema
+        from app.services.nvidia_llm_service import generate_verdict
+
+        gemini_payload = json.dumps({
+            "verdict": "supported",
+            "confidence": 0.91,
+            "confidence_label": "High",
+            "explanation": "Multiple reliable sources directly support the claim.",
+            "user_response": "Reliable evidence supports this claim.",
+            "used_source_ids": [],
+            "key_evidence_ids": [],
+            "warnings": [],
+        })
+
+        extraction = ClaimExtractionSchema(
+            extracted_claim="The government confirmed the event.",
+            detected_language="English",
+            category="Politics",
+            entities=["government"],
+            time_context=None,
+            location_context=None,
+            requires_freshness=False,
+            verification_strategy="official_source_first",
+            detected_claims=[{"claim": "The government confirmed the event.", "priority": 1}],
+        )
+        evidence = [_make_evidence_item()]
+
+        with patch("app.services.nvidia_llm_service.settings") as mock_settings:
+            mock_settings.gemini_reasoning_enabled = True
+            mock_settings.active_gemini_reasoning_model = "gemini-3.5-flash"
+            mock_settings.active_gemini_reasoning_models = ["gemini-3.5-flash"]
+            mock_settings.nvidia_api_key = ""
+            with patch(
+                "app.services.nvidia_llm_service.call_gemini_generate_content",
+                new_callable=AsyncMock,
+                return_value=gemini_payload,
+            ) as mock_gemini:
+                verdict, meta = await generate_verdict(extraction, evidence)
+
+        assert verdict.confidence >= 0.9
+        assert meta["provider"] == "gemini"
+        assert meta["model"] == "gemini-3.5-flash"
+        assert mock_gemini.await_args.kwargs["purpose"] == "reasoning"
+
+    @pytest.mark.asyncio
+    async def test_generate_verdict_falls_back_to_gemini_reasoning_backup_model(self):
+        from app.schemas.verdict_schema import ClaimExtractionSchema
+        from app.services.nvidia_llm_service import generate_verdict
+
+        gemini_payload = json.dumps({
+            "verdict": "supported",
+            "confidence": 0.84,
+            "confidence_label": "High",
+            "explanation": "Reliable evidence supports the claim.",
+            "user_response": "Reliable evidence supports this claim.",
+            "used_source_ids": [],
+            "key_evidence_ids": [],
+            "warnings": [],
+        })
+
+        extraction = ClaimExtractionSchema(
+            extracted_claim="The government confirmed the event.",
+            detected_language="English",
+            category="Politics",
+            entities=["government"],
+            time_context=None,
+            location_context=None,
+            requires_freshness=False,
+            verification_strategy="official_source_first",
+            detected_claims=[{"claim": "The government confirmed the event.", "priority": 1}],
+        )
+        evidence = [_make_evidence_item()]
+
+        with patch("app.services.nvidia_llm_service.settings") as mock_settings:
+            mock_settings.gemini_reasoning_enabled = True
+            mock_settings.active_gemini_reasoning_models = [
+                "gemini-3.5-flash",
+                "gemini-3.1-flash-lite",
+            ]
+            mock_settings.nvidia_api_key = ""
+            with patch(
+                "app.services.nvidia_llm_service.call_gemini_generate_content",
+                new_callable=AsyncMock,
+                side_effect=[RuntimeError("primary failed"), gemini_payload],
+            ) as mock_gemini:
+                verdict, meta = await generate_verdict(extraction, evidence)
+
+        assert verdict.confidence >= 0.8
+        assert meta["provider"] == "gemini"
+        assert meta["model"] == "gemini-3.1-flash-lite"
+        assert mock_gemini.await_count == 2
 
     @pytest.mark.asyncio
     async def test_stance_classification_refutes(self):

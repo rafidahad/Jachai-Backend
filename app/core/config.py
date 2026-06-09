@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     database_sync_url: str = Field(validation_alias=AliasChoices("DATABASE_SYNC_URL"))
     redis_url: str = Field(validation_alias=AliasChoices("REDIS_URL"))
     gemini_api_key: str | None = Field(default=None, validation_alias=AliasChoices("GEMINI_API_KEY"))
+    gemini_backup_api_keys: Annotated[list[str], NoDecode] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("GEMINI_BACKUP_API_KEYS"),
+    )
     gemini_base_url: str = Field(
         default="https://generativelanguage.googleapis.com/v1beta",
         validation_alias=AliasChoices("GEMINI_BASE_URL"),
@@ -37,6 +41,14 @@ class Settings(BaseSettings):
     gemini_claim_extraction_model: str | None = Field(
         default="gemini-3.1-flash-lite",
         validation_alias=AliasChoices("GEMINI_CLAIM_EXTRACTION_MODEL"),
+    )
+    gemini_reasoning_model: str | None = Field(
+        default="gemini-3.5-flash",
+        validation_alias=AliasChoices("GEMINI_REASONING_MODEL", "GEMINI_VERDICT_MODEL"),
+    )
+    gemini_reasoning_fallback_model: str | None = Field(
+        default="gemini-3.1-flash-lite",
+        validation_alias=AliasChoices("GEMINI_REASONING_FALLBACK_MODEL"),
     )
     gemini_timeout_seconds: float = Field(
         default=60.0,
@@ -185,7 +197,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("LLM_JSON_RETRY_COUNT"),
     )
 
-    @field_validator("backend_cors_origins", "trusted_domains", mode="before")
+    @field_validator("backend_cors_origins", "trusted_domains", "gemini_backup_api_keys", mode="before")
     @classmethod
     def parse_cors_origins(cls, value: object) -> list[str]:
         if value is None or value == "":
@@ -289,6 +301,19 @@ class Settings(BaseSettings):
         return self.nvidia_reasoning_model or self.nvidia_llm_model
 
     @property
+    def active_gemini_api_keys(self) -> list[str]:
+        candidates = [self.gemini_api_key, *self.gemini_backup_api_keys]
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            normalized = str(candidate or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped
+
+    @property
     def active_gemini_claim_extraction_model(self) -> str | None:
         if not self.gemini_claim_extraction_model:
             return None
@@ -297,7 +322,41 @@ class Settings(BaseSettings):
 
     @property
     def gemini_claim_extraction_enabled(self) -> bool:
-        return bool(self.gemini_api_key and self.active_gemini_claim_extraction_model)
+        return bool(self.active_gemini_api_keys and self.active_gemini_claim_extraction_model)
+
+    @property
+    def active_gemini_reasoning_model(self) -> str | None:
+        if not self.gemini_reasoning_model:
+            return None
+        normalized = self.gemini_reasoning_model.strip()
+        return normalized or None
+
+    @property
+    def active_gemini_reasoning_fallback_model(self) -> str | None:
+        if not self.gemini_reasoning_fallback_model:
+            return None
+        normalized = self.gemini_reasoning_fallback_model.strip()
+        return normalized or None
+
+    @property
+    def active_gemini_reasoning_models(self) -> list[str]:
+        candidates = [
+            self.active_gemini_reasoning_model,
+            self.active_gemini_reasoning_fallback_model,
+        ]
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            normalized = str(candidate or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped
+
+    @property
+    def gemini_reasoning_enabled(self) -> bool:
+        return bool(self.active_gemini_api_keys and self.active_gemini_reasoning_models)
 
     @property
     def active_nvidia_claim_extraction_model(self) -> str | None:

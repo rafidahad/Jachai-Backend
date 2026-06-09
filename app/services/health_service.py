@@ -12,9 +12,12 @@ async def get_system_health() -> HealthResponseSchema:
     db_ok = await check_database_connection()
     redis_ok = await ping_redis()
     reasoning_ok = bool(
-        settings.nvidia_api_key
-        and settings.nvidia_base_url
-        and settings.active_nvidia_reasoning_model
+        settings.gemini_reasoning_enabled
+        or (
+            settings.nvidia_api_key
+            and settings.nvidia_base_url
+            and settings.active_nvidia_reasoning_model
+        )
     )
     query_ok = bool(
         settings.nvidia_api_key
@@ -60,9 +63,11 @@ async def get_system_health() -> HealthResponseSchema:
             status="healthy" if reasoning_ok else "degraded",
             ok=reasoning_ok,
             message=(
-                "NVIDIA reasoning model is configured."
+                "Gemini reasoning model is configured."
+                if settings.gemini_reasoning_enabled
+                else "NVIDIA reasoning model is configured."
                 if reasoning_ok
-                else "NVIDIA reasoning model is not configured."
+                else "No reasoning model is configured."
             ),
         ),
         ComponentHealthSchema(

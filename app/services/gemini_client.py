@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from time import perf_counter
 from typing import Any
 
@@ -21,8 +22,7 @@ def _gemini_embed_content_url(model: str) -> str:
     return f"{base_url}/models/{model}:embedContent"
 
 
-def _gemini_headers() -> dict[str, str]:
-    api_key = settings.gemini_api_key
+def _gemini_headers(api_key: str) -> dict[str, str]:
     if not api_key:
         raise RuntimeError("Gemini API key is not configured.")
     return {
@@ -71,6 +71,33 @@ def _extract_gemini_embedding(payload: dict[str, Any]) -> list[float]:
         raise RuntimeError("Gemini embedding response contained invalid embedding values.") from exc
 
 
+def _gemini_api_keys() -> list[str]:
+    keys = settings.active_gemini_api_keys
+    if not keys:
+        raise RuntimeError("Gemini API key is not configured.")
+    return keys
+
+
+def _should_failover_to_backup_key(exc: Exception) -> bool:
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return False
+    return exc.response.status_code in {401, 403, 429}
+
+
+def _retry_delay_seconds(exc: Exception, attempt: int) -> float | None:
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return None
+    if exc.response.status_code not in {429, 500, 502, 503, 504}:
+        return None
+    retry_after = exc.response.headers.get("retry-after")
+    if retry_after:
+        try:
+            return max(0.0, float(retry_after))
+        except ValueError:
+            pass
+    return min(8.0, float(2 ** max(0, attempt - 1)))
+
+
 async def call_gemini_generate_content(
     *,
     system_instruction: str,
@@ -79,10 +106,11 @@ async def call_gemini_generate_content(
     response_mime_type: str | None = None,
     response_schema: dict[str, Any] | None = None,
     max_output_tokens: int | None = None,
+    purpose: str = "claim_extraction",
 ) -> str:
     selected_model = model or settings.active_gemini_claim_extraction_model
     if not selected_model:
-        raise RuntimeError("No Gemini model is configured for claim extraction.")
+        raise RuntimeError("No Gemini model is configured for this Gemini request.")
 
     payload: dict[str, Any] = {
         "system_instruction": {
@@ -107,36 +135,62 @@ async def call_gemini_generate_content(
         payload["generationConfig"] = generation_config
 
     last_error: Exception | None = None
-    for attempt in range(1, 3):
-        try:
-            started = perf_counter()
-            logger.info(
-                "gemini_request purpose=claim_extraction model=%s attempt=%s",
-                selected_model,
-                attempt,
-            )
-            async with httpx.AsyncClient(timeout=settings.gemini_timeout_seconds) as client:
-                response = await client.post(
-                    _gemini_generate_content_url(selected_model),
-                    json=payload,
-                    headers=_gemini_headers(),
+    api_keys = _gemini_api_keys()
+    for key_index, api_key in enumerate(api_keys, start=1):
+        for attempt in range(1, 3):
+            try:
+                started = perf_counter()
+                logger.info(
+                    "gemini_request purpose=%s model=%s key_index=%s/%s attempt=%s",
+                    purpose,
+                    selected_model,
+                    key_index,
+                    len(api_keys),
+                    attempt,
                 )
-                response.raise_for_status()
-                body = response.json()
-            logger.info(
-                "gemini_request_succeeded purpose=claim_extraction model=%s attempt=%s latency_ms=%s",
-                selected_model,
-                attempt,
-                round((perf_counter() - started) * 1000, 2),
-            )
-            return _extract_gemini_text(body)
-        except Exception as exc:
-            last_error = exc
-            logger.exception(
-                "gemini_request_failed purpose=claim_extraction model=%s attempt=%s",
-                selected_model,
-                attempt,
-            )
+                async with httpx.AsyncClient(timeout=settings.gemini_timeout_seconds) as client:
+                    response = await client.post(
+                        _gemini_generate_content_url(selected_model),
+                        json=payload,
+                        headers=_gemini_headers(api_key),
+                    )
+                    response.raise_for_status()
+                    body = response.json()
+                logger.info(
+                    "gemini_request_succeeded purpose=%s model=%s key_index=%s/%s attempt=%s latency_ms=%s",
+                    purpose,
+                    selected_model,
+                    key_index,
+                    len(api_keys),
+                    attempt,
+                    round((perf_counter() - started) * 1000, 2),
+                )
+                return _extract_gemini_text(body)
+            except Exception as exc:
+                last_error = exc
+                logger.exception(
+                    "gemini_request_failed purpose=%s model=%s key_index=%s/%s attempt=%s",
+                    purpose,
+                    selected_model,
+                    key_index,
+                    len(api_keys),
+                    attempt,
+                )
+                if _should_failover_to_backup_key(exc) and key_index < len(api_keys):
+                    logger.warning(
+                        "gemini_key_failover purpose=%s model=%s from_key=%s to_key=%s",
+                        purpose,
+                        selected_model,
+                        key_index,
+                        key_index + 1,
+                    )
+                    break
+                retry_delay = _retry_delay_seconds(exc, attempt)
+                if retry_delay is not None and attempt < 2:
+                    await asyncio.sleep(retry_delay)
+                    continue
+                if attempt >= 2:
+                    break
 
     if last_error is not None:
         raise last_error
@@ -168,38 +222,60 @@ async def call_gemini_embed_content(
         payload["title"] = title
 
     last_error: Exception | None = None
-    for attempt in range(1, 3):
-        try:
-            started = perf_counter()
-            logger.info(
-                "gemini_request purpose=embedding model=%s attempt=%s task_type=%s dim=%s",
-                model,
-                attempt,
-                task_type or "unspecified",
-                output_dimensionality or "default",
-            )
-            async with httpx.AsyncClient(timeout=settings.gemini_timeout_seconds) as client:
-                response = await client.post(
-                    _gemini_embed_content_url(model),
-                    json=payload,
-                    headers=_gemini_headers(),
+    api_keys = _gemini_api_keys()
+    for key_index, api_key in enumerate(api_keys, start=1):
+        for attempt in range(1, 3):
+            try:
+                started = perf_counter()
+                logger.info(
+                    "gemini_request purpose=embedding model=%s key_index=%s/%s attempt=%s task_type=%s dim=%s",
+                    model,
+                    key_index,
+                    len(api_keys),
+                    attempt,
+                    task_type or "unspecified",
+                    output_dimensionality or "default",
                 )
-                response.raise_for_status()
-                body = response.json()
-            logger.info(
-                "gemini_request_succeeded purpose=embedding model=%s attempt=%s latency_ms=%s",
-                model,
-                attempt,
-                round((perf_counter() - started) * 1000, 2),
-            )
-            return _extract_gemini_embedding(body)
-        except Exception as exc:
-            last_error = exc
-            logger.exception(
-                "gemini_request_failed purpose=embedding model=%s attempt=%s",
-                model,
-                attempt,
-            )
+                async with httpx.AsyncClient(timeout=settings.gemini_timeout_seconds) as client:
+                    response = await client.post(
+                        _gemini_embed_content_url(model),
+                        json=payload,
+                        headers=_gemini_headers(api_key),
+                    )
+                    response.raise_for_status()
+                    body = response.json()
+                logger.info(
+                    "gemini_request_succeeded purpose=embedding model=%s key_index=%s/%s attempt=%s latency_ms=%s",
+                    model,
+                    key_index,
+                    len(api_keys),
+                    attempt,
+                    round((perf_counter() - started) * 1000, 2),
+                )
+                return _extract_gemini_embedding(body)
+            except Exception as exc:
+                last_error = exc
+                logger.exception(
+                    "gemini_request_failed purpose=embedding model=%s key_index=%s/%s attempt=%s",
+                    model,
+                    key_index,
+                    len(api_keys),
+                    attempt,
+                )
+                if _should_failover_to_backup_key(exc) and key_index < len(api_keys):
+                    logger.warning(
+                        "gemini_key_failover purpose=embedding model=%s from_key=%s to_key=%s",
+                        model,
+                        key_index,
+                        key_index + 1,
+                    )
+                    break
+                retry_delay = _retry_delay_seconds(exc, attempt)
+                if retry_delay is not None and attempt < 2:
+                    await asyncio.sleep(retry_delay)
+                    continue
+                if attempt >= 2:
+                    break
 
     if last_error is not None:
         raise last_error

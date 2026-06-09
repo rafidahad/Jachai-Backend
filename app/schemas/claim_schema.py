@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import Field, HttpUrl, StrictBool, StrictInt, StrictStr
@@ -57,6 +57,35 @@ class ClaimResponseSchema(StrictBaseModel):
     context_payload: dict[str, object] = Field(default_factory=dict)
 
 
+class VerificationEventSchema(StrictBaseModel):
+    key: StrictStr
+    label: StrictStr
+    status: Literal["pending", "running", "completed", "warning", "cached", "failed"]
+    summary: StrictStr
+    timestamp: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class VerificationLiveStatusSchema(StrictBaseModel):
+    stage_key: StrictStr
+    stage_label: StrictStr
+    stage_message: StrictStr
+    stage_index: StrictInt = Field(ge=0)
+    total_stages: StrictInt = Field(ge=1)
+    progress_percent: float = Field(ge=0, le=100)
+    raw_input: StrictStr | None = None
+    cleaned_input: StrictStr | None = None
+    masked_input: StrictStr | None = None
+    extracted_claim: StrictStr | None = None
+    retrieval_query: StrictStr | None = None
+    detected_language: StrictStr | None = None
+    search_queries: list[StrictStr] = Field(default_factory=list)
+    warnings: list[StrictStr] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
+    events: list[VerificationEventSchema] = Field(default_factory=list)
+    updated_at: datetime
+
+
 class VerificationJobSchema(StrictBaseModel):
     id: UUID
     claim_id: UUID | None = None
@@ -69,6 +98,7 @@ class VerificationJobSchema(StrictBaseModel):
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None = None
+    live_status: VerificationLiveStatusSchema | None = None
 
 
 class ClaimSubmissionResponseSchema(StrictBaseModel):
