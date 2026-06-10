@@ -1,0 +1,856 @@
+{
+  "info": {
+    "_postman_id": "d8a8573f-ae20-42c6-b50c-18f8d6775a01",
+    "name": "JachAI Backend API",
+    "description": "End-to-end Postman collection for the JachAI FastAPI backend. It covers health, sources, claims, verification jobs, dashboard, rumor clusters, webhooks, and a small set of negative-path checks. Dynamic IDs are saved into collection variables as the requests run.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://127.0.0.1:8000",
+      "type": "string"
+    },
+    {
+      "key": "internal_api_key",
+      "value": "replace-with-your-internal-api-key",
+      "type": "string"
+    },
+    {
+      "key": "claim_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "job_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "source_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "cluster_id",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "external_id",
+      "value": "postman-e2e-001",
+      "type": "string"
+    },
+    {
+      "key": "reviewer",
+      "value": "postman-reviewer",
+      "type": "string"
+    },
+    {
+      "key": "sample_claim_text",
+      "value": "A viral post claims the government has announced a nationwide internet shutdown tonight.",
+      "type": "string"
+    },
+    {
+      "key": "sample_claim_url",
+      "value": "https://en.wikipedia.org/wiki/Fact-checking",
+      "type": "string"
+    },
+    {
+      "key": "sample_webhook_text",
+      "value": "Forwarded claim: free fuel for everyone tomorrow.",
+      "type": "string"
+    },
+    {
+      "key": "sample_webhook_url",
+      "value": "https://en.wikipedia.org/wiki/Misinformation",
+      "type": "string"
+    },
+    {
+      "key": "test_materials_dir",
+      "value": "/run/media/bakau/WORKPLACE/JachAI/backend/postman/test-materials",
+      "type": "string"
+    },
+    {
+      "key": "sample_image_path",
+      "value": "/run/media/bakau/WORKPLACE/JachAI/backend/postman/test-materials/sample_claim_image.png",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "01 Root Health",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Root health status is ok', function () { pm.expect(data.status).to.eql('ok'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/health",
+            "description": "Basic liveness check."
+          }
+        },
+        {
+          "name": "02 System Health",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('System health contains components', function () { pm.expect(data.components).to.be.an('array'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/health/system",
+            "description": "Checks DB, Redis, NVIDIA config, and Tesseract availability."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Sources",
+      "item": [
+        {
+          "name": "01 Ingest Sample Sources",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Source ingest returns at least one source', function () { pm.expect(data.items).to.be.an('array').and.not.empty; });",
+                  "if (data.items && data.items.length) { pm.collectionVariables.set('source_id', data.items[0].id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"items\": [\n    {\n      \"title\": \"Government fact-check bulletin on viral internet shutdown claim\",\n      \"url\": \"https://example.com/fact-check/internet-shutdown\",\n      \"publisher\": \"JachAI Sample Source\",\n      \"language\": \"English\",\n      \"source_type\": \"fact_check\",\n      \"snippet\": \"A sample fact-check source used for Postman verification flow tests.\",\n      \"text_content\": \"This sample source says there is no official nationwide internet shutdown announcement for tonight. Users should rely on official telecom notices and government statements instead of forwarded rumors.\",\n      \"metadata\": {\n        \"seeded_by\": \"postman\",\n        \"category\": \"fact_check\"\n      }\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{base_url}}/api/v1/sources/ingest",
+            "description": "Protected endpoint. Seeds at least one evidence source so the claim pipeline has something to retrieve. Matching material file: `postman/test-materials/source_ingest_payload.json`."
+          }
+        },
+        {
+          "name": "02 List Sources",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('List sources returns an array', function () { pm.expect(data.items).to.be.an('array'); });",
+                  "if (data.items && data.items.length) { pm.collectionVariables.set('source_id', data.items[0].id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/sources"
+          }
+        },
+        {
+          "name": "03 Get Source By ID",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Source ID matches variable', function () { pm.expect(data.id).to.eql(pm.collectionVariables.get('source_id')); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/sources/{{source_id}}",
+            "description": "Requires `source_id` from the source ingest or source list request."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Claims",
+      "item": [
+        {
+          "name": "01 Submit Text Claim",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Text claim returns job and claim', function () { pm.expect(data.job.id).to.be.a('string'); pm.expect(data.claim.id).to.be.a('string'); });",
+                  "pm.collectionVariables.set('job_id', data.job.id);",
+                  "pm.collectionVariables.set('claim_id', data.claim.id);",
+                  "if (data.claim.cluster_id) { pm.collectionVariables.set('cluster_id', data.claim.cluster_id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"{{sample_claim_text}}\",\n  \"external_id\": \"{{external_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{base_url}}/api/v1/claims/text",
+            "description": "Matching material file: `postman/test-materials/claim_text_payload.json`."
+          }
+        },
+        {
+          "name": "02 Submit Image Claim",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200 or an expected image/OCR failure', function () { pm.expect([200, 422, 500]).to.include(pm.response.code); });",
+                  "const data = pm.response.json();",
+                  "if (pm.response.code === 200 && data.claim) { pm.collectionVariables.set('job_id', data.job.id); pm.collectionVariables.set('claim_id', data.claim.id); if (data.claim.cluster_id) { pm.collectionVariables.set('cluster_id', data.claim.cluster_id); } }",
+                  "if (pm.response.code !== 200) { pm.test('Structured error is returned', function () { pm.expect(data.error).to.be.an('object'); }); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "image",
+                  "type": "file",
+                  "src": "/run/media/bakau/WORKPLACE/JachAI/backend/postman/test-materials/sample_claim_image.png",
+                  "description": "Bundled OCR sample image. If Postman does not auto-attach it after import, browse to `{{sample_image_path}}` manually."
+                },
+                {
+                  "key": "external_id",
+                  "value": "{{external_id}}-image",
+                  "type": "text"
+                }
+              ]
+            },
+            "url": "{{base_url}}/api/v1/claims/image",
+            "description": "Uses the bundled OCR sample image at `postman/test-materials/sample_claim_image.png`. Reference OCR text: `postman/test-materials/sample_claim_image_expected_ocr.txt`. OCR depends on Tesseract being installed on the backend host."
+          }
+        },
+        {
+          "name": "03 Submit URL Claim",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200 or 422', function () { pm.expect([200, 422]).to.include(pm.response.code); });",
+                  "const data = pm.response.json();",
+                  "if (pm.response.code === 200 && data.claim) { pm.collectionVariables.set('job_id', data.job.id); pm.collectionVariables.set('claim_id', data.claim.id); if (data.claim.cluster_id) { pm.collectionVariables.set('cluster_id', data.claim.cluster_id); } }",
+                  "if (pm.response.code === 422) { pm.test('Structured error is returned', function () { pm.expect(data.error).to.be.an('object'); }); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"url\": \"{{sample_claim_url}}\",\n  \"external_id\": \"{{external_id}}-url\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{base_url}}/api/v1/claims/url",
+            "description": "Matching material file: `postman/test-materials/claim_url_payload.json`. Depends on outbound HTTP access from the backend and enough text on the target page."
+          }
+        },
+        {
+          "name": "04 Get Verification Job",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Job ID matches variable', function () { pm.expect(data.id).to.eql(pm.collectionVariables.get('job_id')); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/verification-jobs/{{job_id}}",
+            "description": "Requires `job_id` from one of the claim or webhook submissions."
+          }
+        },
+        {
+          "name": "05 Get Claim By ID",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Claim lookup returns the selected claim', function () { pm.expect(data.claim.id).to.eql(pm.collectionVariables.get('claim_id')); });",
+                  "if (data.claim.cluster_id) { pm.collectionVariables.set('cluster_id', data.claim.cluster_id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/claims/{{claim_id}}",
+            "description": "Requires `claim_id` from a successful claim or webhook submission."
+          }
+        },
+        {
+          "name": "06 Get Claim Share Summary",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Share summary belongs to the selected claim', function () { pm.expect(data.claim_id).to.eql(pm.collectionVariables.get('claim_id')); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/claims/{{claim_id}}/share-summary"
+          }
+        },
+        {
+          "name": "07 Update Claim Review Status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Review status is updated', function () { pm.expect(data.claim.review_status).to.eql('reviewed'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"review_status\": \"reviewed\",\n  \"reviewer\": \"{{reviewer}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{base_url}}/api/v1/claims/{{claim_id}}/review-status",
+            "description": "Matching material file: `postman/test-materials/review_status_payload.json`."
+          }
+        },
+        {
+          "name": "08 List Claims",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Claim list returns an array', function () { pm.expect(data.items).to.be.an('array'); });",
+                  "if (data.items && data.items.length) { pm.collectionVariables.set('claim_id', data.items[0].id); if (data.items[0].cluster_id) { pm.collectionVariables.set('cluster_id', data.items[0].cluster_id); } }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/claims?limit=10&offset=0"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Dashboard",
+      "item": [
+        {
+          "name": "01 Summary",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Dashboard summary contains metrics', function () { pm.expect(data.metrics).to.be.an('object'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/dashboard/summary"
+          }
+        },
+        {
+          "name": "02 Verdict Distribution",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Verdict distribution returns an array', function () { pm.expect(data.items).to.be.an('array'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/dashboard/verdict-distribution"
+          }
+        },
+        {
+          "name": "03 Language Distribution",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Language distribution returns an array', function () { pm.expect(data.items).to.be.an('array'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/dashboard/language-distribution"
+          }
+        },
+        {
+          "name": "04 Claims Over Time",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Claims-over-time returns an array', function () { pm.expect(data.items).to.be.an('array'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/dashboard/claims-over-time"
+          }
+        },
+        {
+          "name": "05 Recent Claims",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Recent claims returns an array', function () { pm.expect(data.items).to.be.an('array'); });",
+                  "if (data.items && data.items.length) { pm.collectionVariables.set('claim_id', data.items[0].id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/dashboard/recent-claims"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Rumor Clusters",
+      "item": [
+        {
+          "name": "01 List Rumor Clusters",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Rumor clusters returns an array', function () { pm.expect(data.items).to.be.an('array'); });",
+                  "if (data.items && data.items.length) { pm.collectionVariables.set('cluster_id', data.items[0].id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/rumor-clusters"
+          }
+        },
+        {
+          "name": "02 Get Rumor Cluster By ID",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Cluster detail returns selected cluster', function () { pm.expect(data.cluster.id).to.eql(pm.collectionVariables.get('cluster_id')); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/rumor-clusters/{{cluster_id}}",
+            "description": "Requires `cluster_id` from a successful claim or cluster list."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Webhooks",
+      "item": [
+        {
+          "name": "01 Inbound Message Webhook - Text",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200', function () { pm.response.to.have.status(200); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Webhook text returns job and claim', function () { pm.expect(data.job.id).to.be.a('string'); pm.expect(data.claim.id).to.be.a('string'); });",
+                  "pm.collectionVariables.set('job_id', data.job.id);",
+                  "pm.collectionVariables.set('claim_id', data.claim.id);",
+                  "if (data.claim.cluster_id) { pm.collectionVariables.set('cluster_id', data.claim.cluster_id); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message_type\": \"text\",\n  \"message_text\": \"{{sample_webhook_text}}\",\n  \"external_id\": \"{{external_id}}-webhook-text\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{base_url}}/api/v1/webhooks/inbound-message",
+            "description": "Matching material file: `postman/test-materials/webhook_text_payload.json`."
+          }
+        },
+        {
+          "name": "02 Inbound Message Webhook - URL",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200 or 422', function () { pm.expect([200, 422]).to.include(pm.response.code); });",
+                  "const data = pm.response.json();",
+                  "if (pm.response.code === 200 && data.claim) { pm.collectionVariables.set('job_id', data.job.id); pm.collectionVariables.set('claim_id', data.claim.id); if (data.claim.cluster_id) { pm.collectionVariables.set('cluster_id', data.claim.cluster_id); } }",
+                  "if (pm.response.code === 422) { pm.test('Structured error is returned', function () { pm.expect(data.error).to.be.an('object'); }); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message_type\": \"url\",\n  \"message_url\": \"{{sample_webhook_url}}\",\n  \"external_id\": \"{{external_id}}-webhook-url\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{base_url}}/api/v1/webhooks/inbound-message",
+            "description": "Matching material file: `postman/test-materials/webhook_url_payload.json`. Depends on outbound HTTP access from the backend."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Negative Cases",
+      "item": [
+        {
+          "name": "01 Unauthorized Source Ingest",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 401', function () { pm.response.to.have.status(401); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Unauthorized error payload is returned', function () { pm.expect(data.error.code).to.eql('UNAUTHORIZED'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"items\": [\n    {\n      \"title\": \"Unauthorized ingest test\",\n      \"url\": \"https://example.com/unauthorized-source-test\",\n      \"publisher\": \"Postman\",\n      \"language\": \"English\",\n      \"source_type\": \"article\",\n      \"snippet\": \"This request intentionally omits the internal API key.\",\n      \"text_content\": \"This request intentionally omits the internal API key to verify that the backend rejects protected source-ingest calls.\",\n      \"metadata\": {\n        \"case\": \"unauthorized\"\n      }\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{base_url}}/api/v1/sources/ingest",
+            "description": "Matching material file: `postman/test-materials/unauthorized_source_ingest_payload.json`."
+          }
+        },
+        {
+          "name": "02 Invalid Text Claim",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422', function () { pm.response.to.have.status(422); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Validation error payload is returned', function () { pm.expect(data.error.code).to.eql('VALIDATION_ERROR'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"text\": \"bad\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{base_url}}/api/v1/claims/text",
+            "description": "Matching material file: `postman/test-materials/invalid_text_claim_payload.json`."
+          }
+        },
+        {
+          "name": "03 Claim Not Found",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 404', function () { pm.response.to.have.status(404); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Claim-not-found error payload is returned', function () { pm.expect(data.error.code).to.eql('CLAIM_NOT_FOUND'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{base_url}}/api/v1/claims/11111111-1111-1111-1111-111111111111"
+          }
+        },
+        {
+          "name": "04 Invalid Webhook Payload",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 422', function () { pm.response.to.have.status(422); });",
+                  "const data = pm.response.json();",
+                  "pm.test('Webhook validation error payload is returned', function () { pm.expect(data.error.code).to.eql('INVALID_WEBHOOK_PAYLOAD'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "X-Internal-API-Key",
+                "value": "{{internal_api_key}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message_type\": \"text\",\n  \"external_id\": \"{{external_id}}-invalid-webhook\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": "{{base_url}}/api/v1/webhooks/inbound-message",
+            "description": "Matching material file: `postman/test-materials/invalid_webhook_payload.json`."
+          }
+        }
+      ]
+    }
+  ]
+}

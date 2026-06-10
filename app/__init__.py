@@ -1,0 +1,1 @@
+"""JachAI backend application package."""
