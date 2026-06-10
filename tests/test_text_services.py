@@ -54,3 +54,30 @@ def test_embed_text_uses_gemini_embeddings_with_retrieval_task_types() -> None:
 
     normalized = asyncio.run(run())
     assert normalized == [0.6, 0.8]
+
+
+def test_embed_texts_batches_local_embeddings() -> None:
+    import asyncio
+    from unittest.mock import MagicMock, patch
+
+    from app.services.embedding_service import embed_texts
+
+    async def run() -> list[list[float]]:
+        with patch("app.services.embedding_service.settings") as mock_settings:
+            mock_settings.embedding_uses_gemini = False
+            model = MagicMock()
+            model.encode.return_value = [[0.6, 0.8], [1.0, 0.0]]
+            with patch("app.services.embedding_service.get_embedding_model", return_value=model):
+                values = await embed_texts(
+                    ["First claim", "Second claim"],
+                    task_type="RETRIEVAL_DOCUMENT",
+                    titles=["one", "two"],
+                )
+                model.encode.assert_called_once_with(
+                    ["First claim", "Second claim"],
+                    normalize_embeddings=True,
+                )
+                return values
+
+    vectors = asyncio.run(run())
+    assert vectors == [[0.6, 0.8], [1.0, 0.0]]

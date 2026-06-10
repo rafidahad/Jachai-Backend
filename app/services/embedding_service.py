@@ -36,28 +36,56 @@ def _normalize_embedding(values: list[float]) -> list[float]:
     return [float(value / magnitude) for value in values]
 
 
+async def embed_texts(
+    values: list[str],
+    *,
+    task_type: str | None = None,
+    titles: list[str | None] | None = None,
+) -> list[list[float]]:
+    if not values:
+        return []
+    if titles is not None and len(titles) != len(values):
+        raise ValueError("titles must match values length")
+
+    if settings.embedding_uses_gemini:
+        vectors: list[list[float]] = []
+        for index, value in enumerate(values):
+            vectors.append(
+                await call_gemini_embed_content(
+                    content=value,
+                    model=settings.embedding_model,
+                    output_dimensionality=settings.embedding_dim,
+                    task_type=task_type,
+                    title=titles[index] if titles else None,
+                )
+            )
+        return [_normalize_embedding(vector) for vector in vectors]
+
+    def _encode_batch() -> list[list[float]]:
+        model = get_embedding_model()
+        vectors = model.encode(values, normalize_embeddings=True)
+        raw_vectors = vectors.tolist() if hasattr(vectors, "tolist") else list(vectors)
+        normalized_vectors: list[list[float]] = []
+        for vector in raw_vectors:
+            vector_values = vector.tolist() if hasattr(vector, "tolist") else list(vector)
+            normalized_vectors.append([float(item) for item in vector_values])
+        return normalized_vectors
+
+    return await asyncio.to_thread(_encode_batch)
+
+
 async def embed_text(
     value: str,
     *,
     task_type: str | None = None,
     title: str | None = None,
 ) -> list[float]:
-    if settings.embedding_uses_gemini:
-        vector = await call_gemini_embed_content(
-            content=value,
-            model=settings.embedding_model,
-            output_dimensionality=settings.embedding_dim,
-            task_type=task_type,
-            title=title,
-        )
-        return _normalize_embedding(vector)
-
-    def _encode() -> list[float]:
-        model = get_embedding_model()
-        vector = model.encode(value, normalize_embeddings=True)
-        return [float(item) for item in vector.tolist()]
-
-    return await asyncio.to_thread(_encode)
+    vectors = await embed_texts(
+        [value],
+        task_type=task_type,
+        titles=[title],
+    )
+    return vectors[0]
 
 
 async def preload_embedding_model() -> dict[str, object]:
