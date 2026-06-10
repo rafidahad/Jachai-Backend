@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import require_admin_session
@@ -23,7 +23,11 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
 @router.get("/summary", response_model=DashboardSummaryResponseSchema)
-async def dashboard_summary(session: AsyncSession = Depends(get_db)) -> DashboardSummaryResponseSchema:
+async def dashboard_summary(
+    response: Response,
+    session: AsyncSession = Depends(get_db),
+) -> DashboardSummaryResponseSchema:
+    response.headers["Cache-Control"] = "public, max-age=15, stale-while-revalidate=60"
     return DashboardSummaryResponseSchema(metrics=await get_summary_metrics(session))
 
 

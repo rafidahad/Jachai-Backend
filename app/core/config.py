@@ -138,6 +138,10 @@ class Settings(BaseSettings):
         default=60 * 60 * 48,
         validation_alias=AliasChoices("DUPLICATE_CACHE_TTL_SECONDS", "CLAIM_CACHE_TTL_SECONDS"),
     )
+    dashboard_summary_cache_ttl_seconds: int = Field(
+        default=15,
+        validation_alias=AliasChoices("DASHBOARD_SUMMARY_CACHE_TTL_SECONDS"),
+    )
     job_status_ttl_seconds: int = 60 * 60 * 24
     claim_rate_limit_per_minute: int = 20
     internal_rate_limit_per_minute: int = 60
