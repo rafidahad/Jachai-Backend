@@ -1,0 +1,27 @@
+services:
+  jachai-postgres:
+    container_name: jachai-postgres
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-jachai}
+      POSTGRES_USER: ${POSTGRES_USER:-jachai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_this_postgres_password}
+    ports:
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - jachai_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jachai} -d ${POSTGRES_DB:-jachai}"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+
+  jachai-backend:
+    depends_on:
+      jachai-postgres:
+        condition: service_healthy
+
+volumes:
+  jachai_postgres_data:
