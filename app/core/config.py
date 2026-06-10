@@ -101,6 +101,10 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("EMBEDDING_DIM", "EMBEDDING_DIMENSION"),
     )
     embedding_device: str = Field(default="cpu", validation_alias=AliasChoices("EMBEDDING_DEVICE"))
+    warm_embedding_model_on_startup: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("WARM_EMBEDDING_MODEL_ON_STARTUP", "PRELOAD_EMBEDDING_MODEL_ON_STARTUP"),
+    )
     internal_api_key: str = Field(validation_alias=AliasChoices("INTERNAL_API_KEY"))
     admin_username: str | None = Field(default=None, validation_alias=AliasChoices("ADMIN_USERNAME"))
     admin_password: str | None = Field(default=None, validation_alias=AliasChoices("ADMIN_PASSWORD"))
@@ -304,6 +308,7 @@ class Settings(BaseSettings):
         "enable_debug_output",
         "auto_create_tables",
         "bootstrap_database_on_startup",
+        "warm_embedding_model_on_startup",
         mode="before",
     )
     @classmethod

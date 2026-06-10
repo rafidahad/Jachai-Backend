@@ -4,6 +4,7 @@ from app.core.config import settings
 from app.core.database import check_database_connection
 from app.core.redis import ping_redis
 from app.db.session import SessionLocal
+from app.services.embedding_service import check_embedding_backend
 from app.services.evidence_index_service import get_evidence_index_status
 from app.schemas.health_schema import ComponentHealthSchema, HealthResponseSchema
 
@@ -22,6 +23,7 @@ async def get_system_health() -> HealthResponseSchema:
     _, readiness_checks = await get_runtime_readiness()
     db_ok = readiness_checks["database"]
     redis_ok = readiness_checks["redis"]
+    embedding_ok, embedding_message = await check_embedding_backend()
     reasoning_ok = bool(
         settings.gemini_reasoning_enabled
         or (
@@ -68,6 +70,12 @@ async def get_system_health() -> HealthResponseSchema:
             status="healthy" if redis_ok else "unavailable",
             ok=redis_ok,
             message="Redis ping ok." if redis_ok else "Redis ping failed.",
+        ),
+        ComponentHealthSchema(
+            name="embedding_backend",
+            status="healthy" if embedding_ok else "degraded",
+            ok=embedding_ok,
+            message=embedding_message,
         ),
         ComponentHealthSchema(
             name="nvidia_reasoning",

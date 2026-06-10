@@ -13,12 +13,16 @@ services:
       DEBUG: ${DEBUG:-false}
       AUTO_CREATE_TABLES: ${AUTO_CREATE_TABLES:-false}
       BOOTSTRAP_DATABASE_ON_STARTUP: ${BOOTSTRAP_DATABASE_ON_STARTUP:-false}
+      WARM_EMBEDDING_MODEL_ON_STARTUP: ${WARM_EMBEDDING_MODEL_ON_STARTUP:-false}
       # This compose file assumes PostgreSQL and Redis are already running
       # and are provided through DATABASE_URL / REDIS_URL in backend/.env.
       UVICORN_HOST: 0.0.0.0
       UVICORN_PORT: 8000
       UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
       UVICORN_LOG_LEVEL: ${UVICORN_LOG_LEVEL:-info}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+      MKL_NUM_THREADS: ${MKL_NUM_THREADS:-1}
+      TOKENIZERS_PARALLELISM: ${TOKENIZERS_PARALLELISM:-false}
       WAIT_FOR_SERVICES: ${WAIT_FOR_SERVICES:-true}
       WAIT_TIMEOUT_SECONDS: ${WAIT_TIMEOUT_SECONDS:-75}
       HF_HOME: /data/huggingface

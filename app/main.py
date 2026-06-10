@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.core.database import close_database, init_database
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import close_redis, init_redis
+from app.services.embedding_service import preload_embedding_model
 from app.services.health_service import get_runtime_readiness
 from app.utils.errors import AppError
 
@@ -23,6 +24,15 @@ logger = get_logger(__name__)
 async def lifespan(_: FastAPI):
     await init_database()
     await init_redis()
+    if settings.warm_embedding_model_on_startup:
+        metadata = await preload_embedding_model()
+        logger.info(
+            "embedding_backend_ready backend=%s model=%s device=%s dimension=%s",
+            metadata["backend"],
+            metadata["model"],
+            metadata["device"],
+            metadata["dimension"],
+        )
     yield
     await close_redis()
     await close_database()
