@@ -31,6 +31,7 @@ dist
 *.log
 
 postman
+tests
 improved_fact_check_workflow.html
 JachAI_Backend_AI_Usage_Spec_Updated.md
 JachAI_Backend_PRD_and_Codex_Prompts.md

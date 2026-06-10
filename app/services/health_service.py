@@ -8,9 +8,20 @@ from app.services.evidence_index_service import get_evidence_index_status
 from app.schemas.health_schema import ComponentHealthSchema, HealthResponseSchema
 
 
-async def get_system_health() -> HealthResponseSchema:
+async def get_runtime_readiness() -> tuple[bool, dict[str, bool]]:
     db_ok = await check_database_connection()
     redis_ok = await ping_redis()
+    checks = {
+        "database": db_ok,
+        "redis": redis_ok,
+    }
+    return all(checks.values()), checks
+
+
+async def get_system_health() -> HealthResponseSchema:
+    _, readiness_checks = await get_runtime_readiness()
+    db_ok = readiness_checks["database"]
+    redis_ok = readiness_checks["redis"]
     reasoning_ok = bool(
         settings.gemini_reasoning_enabled
         or (
