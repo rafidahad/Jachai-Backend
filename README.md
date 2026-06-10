@@ -29,6 +29,28 @@ uv run uvicorn app.main:app --reload
 
 The API will be available at `http://127.0.0.1:8000`, with docs at `/docs`.
 
+## Local BGE-M3 Embeddings
+
+The default embedding backend is local `BAAI/bge-m3` with 1024 dimensions.
+
+Recommended VPS settings:
+
+```env
+EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_DIMENSION=1024
+EMBEDDING_DEVICE=cpu
+WARM_EMBEDDING_MODEL_ON_STARTUP=true
+OMP_NUM_THREADS=1
+MKL_NUM_THREADS=1
+TOKENIZERS_PARALLELISM=false
+```
+
+To preload the model into cache before serving traffic:
+
+```bash
+uv run python scripts/preload_embedding_model.py
+```
+
 ## Expected Environment
 
 - Python 3.11 or 3.12

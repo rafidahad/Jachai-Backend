@@ -28,6 +28,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH=/opt/venv/bin:$PATH \
     PYTHONPATH=/app \
     HOME=/home/jachai \
+    TOKENIZERS_PARALLELISM=false \
     HF_HOME=/data/huggingface \
     SENTENCE_TRANSFORMERS_HOME=/data/sentence-transformers
 

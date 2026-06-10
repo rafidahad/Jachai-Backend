@@ -24,13 +24,16 @@ Use these defaults first:
 
 - `UVICORN_WORKERS=1`
 - `EMBEDDING_DEVICE=cpu`
-- prefer Gemini embeddings if the local `BAAI/bge-m3` model is too heavy
+- `WARM_EMBEDDING_MODEL_ON_STARTUP=true`
+- `OMP_NUM_THREADS=1`
+- `MKL_NUM_THREADS=1`
+- `TOKENIZERS_PARALLELISM=false`
 
 Why:
 
 - the backend is I/O-heavy and model calls are mostly remote,
 - a single worker avoids multiplying model memory,
-- local `BAAI/bge-m3` can be memory-hungry on a small VPS.
+- local `BAAI/bge-m3` can be memory-hungry on a small VPS, so one worker and conservative CPU threading are safer.
 
 ## 1. Prepare `backend/.env`
 
@@ -54,6 +57,9 @@ Important values:
 - `ADMIN_PASSWORD`
 - `ADMIN_AUTH_SECRET`
 - `CORS_ORIGINS`
+- `EMBEDDING_MODEL`
+- `EMBEDDING_DEVICE`
+- `WARM_EMBEDDING_MODEL_ON_STARTUP`
 
 Important:
 
@@ -61,6 +67,22 @@ Important:
 - If you use Neon, do not leave `DATABASE_SYNC_URL` on a placeholder host. It should match your real Neon host and database name.
 - Leave `AUTO_CREATE_TABLES=false` and `BOOTSTRAP_DATABASE_ON_STARTUP=false` for normal production startup.
 - Set `CORS_ORIGINS` to your real frontend origin, for example `https://jachai.example.com`.
+- For local embeddings on the VPS, keep `EMBEDDING_MODEL=BAAI/bge-m3` and `EMBEDDING_DEVICE=cpu`.
+
+Recommended local embedding settings for `BAAI/bge-m3`:
+
+```env
+EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_DIMENSION=1024
+EMBEDDING_DEVICE=cpu
+HF_TOKEN=
+WARM_EMBEDDING_MODEL_ON_STARTUP=true
+OMP_NUM_THREADS=1
+MKL_NUM_THREADS=1
+TOKENIZERS_PARALLELISM=false
+```
+
+`HF_TOKEN` is optional, but recommended if you want more reliable Hugging Face downloads and higher rate limits during the first model preload.
 
 If your Redis is already running on the VPS host and published on port `6379`, this is the simplest Linux Docker value:
 
@@ -98,7 +120,18 @@ That command:
 
 After that, keep `AUTO_CREATE_TABLES=false` and `BOOTSTRAP_DATABASE_ON_STARTUP=false`.
 
-## 3. Deploy with external PostgreSQL
+## 3. Optional: preload the local embedding model
+
+If you are using `BAAI/bge-m3` in the container, preload it once so the model is downloaded into the Docker volume before you put traffic on the backend:
+
+```bash
+cd backend
+docker compose run --rm jachai-backend python scripts/preload_embedding_model.py
+```
+
+That preloads the model into the persisted `/data` cache used by Hugging Face and Sentence Transformers.
+
+## 4. Deploy with external PostgreSQL
 
 This is your current recommended path because you are already using Neon and an existing Redis instance:
 
@@ -107,7 +140,14 @@ cd backend
 docker compose up -d --build
 ```
 
-## 4. Optional: deploy with local pgvector PostgreSQL
+Verify the backend locally on the VPS:
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/readyz
+```
+
+## 5. Optional: deploy with local pgvector PostgreSQL
 
 If you want Postgres on the same VPS, first set these in `backend/.env`:
 
@@ -130,7 +170,14 @@ cd backend
 docker compose -f docker-compose.yml -f docker-compose.pgvector.yml run --rm jachai-backend python scripts/bootstrap_db.py
 ```
 
-## 5. Reverse proxy note
+If you are using `BAAI/bge-m3` with local Postgres too, preload the embedding model after the stack is available:
+
+```bash
+cd backend
+docker compose -f docker-compose.yml -f docker-compose.pgvector.yml run --rm jachai-backend python scripts/preload_embedding_model.py
+```
+
+## 6. Reverse proxy note
 
 By default, compose binds the backend only to localhost:
 
@@ -149,7 +196,17 @@ If your reverse proxy runs in another Docker container instead of on the VPS hos
 - set `BACKEND_BIND_ADDRESS=0.0.0.0`, or
 - put both services on the same Docker network and proxy to the service name.
 
-## 6. Useful commands
+Example host-level Nginx config:
+
+- [deploy/nginx/api-jachai.rafidahad.me.conf.example](./deploy/nginx/api-jachai.rafidahad.me.conf.example)
+
+If you are using the frontend on Vercel or another separate host, set its production backend URL to:
+
+```env
+BACKEND_API_URL=https://api-jachai.rafidahad.me/api/v1
+```
+
+## 7. Useful commands
 
 View logs:
 
@@ -186,7 +243,7 @@ cd backend
 docker compose -f docker-compose.yml -f docker-compose.pgvector.yml down
 ```
 
-## 7. Health checks
+## 8. Health checks
 
 Liveness:
 
@@ -206,10 +263,12 @@ Detailed system health:
 curl http://127.0.0.1:8000/api/v1/health/system
 ```
 
-## 8. Important current behavior
+## 9. Important current behavior
 
 - The container health check now uses `/readyz`, which verifies both PostgreSQL and Redis.
 - The app verifies database and Redis connectivity on startup.
+- If `WARM_EMBEDDING_MODEL_ON_STARTUP=true`, the app also loads the configured embedding backend before accepting traffic.
+- The admin system health endpoint now reports whether the embedding backend is ready.
 - The app does not create extensions or tables on ordinary production startup unless you explicitly enable bootstrap behavior.
 - The container waits for Postgres and Redis before starting Uvicorn.
 - The model cache is persisted in a Docker volume so local embedding downloads are not repeated every deploy.
