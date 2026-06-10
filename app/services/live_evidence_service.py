@@ -167,6 +167,24 @@ def _article_text_from_html(
     return title, text_content, description, language, published_date
 
 
+async def _read_capped_response_bytes(
+    response: httpx.Response,
+    *,
+    max_bytes: int,
+) -> bytes:
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if not chunk:
+            continue
+        remaining = max_bytes - len(body)
+        if remaining <= 0:
+            break
+        body.extend(chunk[:remaining])
+        if len(body) >= max_bytes:
+            break
+    return bytes(body)
+
+
 async def _crawl_result_url(
     client: httpx.AsyncClient,
     result: NormalizedSearchResult,
@@ -176,30 +194,29 @@ async def _crawl_result_url(
     Raises on failure.
     """
     # Enforce max fetch size via HEAD check or content-length
-    timeout = settings.fetch_timeout_seconds
     max_bytes = settings.max_fetch_bytes
 
-    response = await client.get(
+    async with client.stream(
+        "GET",
         result.url,
         headers=_build_request_headers(),
         follow_redirects=True,
+    ) as response:
+        response.raise_for_status()
+
+        # Check content-type — only parse HTML
+        content_type = response.headers.get("content-type", "")
+        if "html" not in content_type and "text" not in content_type:
+            raise ValueError(f"Non-HTML content-type: {content_type}")
+
+        raw_bytes = await _read_capped_response_bytes(response, max_bytes=max_bytes)
+        final_url = normalize_search_url(str(response.url))
+
+    html = raw_bytes.decode("utf-8", errors="replace")
+    title, text_content, description, html_language, published_date = await asyncio.to_thread(
+        _article_text_from_html,
+        html,
     )
-    response.raise_for_status()
-
-    # Check content-type — only parse HTML
-    content_type = response.headers.get("content-type", "")
-    if "html" not in content_type and "text" not in content_type:
-        raise ValueError(f"Non-HTML content-type: {content_type}")
-
-    # Truncate to max bytes
-    raw_bytes = response.content[:max_bytes]
-    try:
-        html = raw_bytes.decode("utf-8", errors="replace")
-    except Exception:
-        html = response.text
-
-    final_url = normalize_search_url(str(response.url))
-    title, text_content, description, html_language, published_date = _article_text_from_html(html)
     if final_url != result.url:
         result.url = final_url
         result.domain = _domain_from_url(final_url)
@@ -299,10 +316,12 @@ async def _document_from_search_result(
 async def _run_tavily_queries(query_texts: list[str]) -> tuple[list[TavilySearchResponse], list[str]]:
     responses: list[TavilySearchResponse] = []
     errors: list[str] = []
-    results = await asyncio.gather(
-        *[search_with_tavily(query) for query in query_texts],
-        return_exceptions=True,
-    )
+    timeout = min(settings.request_timeout_seconds, settings.live_evidence_timeout_seconds)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        results = await asyncio.gather(
+            *[search_with_tavily(query, client=client) for query in query_texts],
+            return_exceptions=True,
+        )
     for result in results:
         if isinstance(result, Exception):
             logger.warning("tavily_query_failed error=%s", result)
