@@ -31,7 +31,7 @@ from app.schemas.verdict_schema import EvidenceSnippetSchema, LLMVerdictSchema
 from app.services.ai_model_router import NVIDIAModelTask, get_model_for_task
 from app.services.cache_service import cache_service
 from app.services.cluster_service import get_or_create_cluster
-from app.services.embedding_service import embed_text
+from app.services.embedding_service import embed_texts
 from app.services.evidence_chunker import chunk_evidence_documents
 from app.services.evidence_index_service import get_evidence_index_status
 from app.services.language_service import detect_language
@@ -1628,11 +1628,11 @@ async def _pipeline_from_text(
         }
 
         retrieved_result_sets: list[list[tuple[Any, float]]] = []
-        for query_variant in retrieval_variants:
-            embedding = await embed_text(
-                query_variant,
-                task_type="RETRIEVAL_QUERY",
-            )
+        query_embeddings = await embed_texts(
+            retrieval_variants,
+            task_type="RETRIEVAL_QUERY",
+        )
+        for embedding in query_embeddings:
             retrieved_result_sets.append(
                 await retrieve_evidence(session, embedding, top_k=settings.pgvector_top_k)
             )
