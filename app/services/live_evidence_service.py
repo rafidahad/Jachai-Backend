@@ -375,6 +375,7 @@ async def hydrate_live_evidence(
         normalized_results,
         claim_text=claim_text,
         limit=cap,
+        claim_texts=query_texts,
     )
 
     request_ids = [response.request_id for response in tavily_responses if response.request_id]

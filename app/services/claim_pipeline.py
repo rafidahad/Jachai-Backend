@@ -324,6 +324,39 @@ def _preview_text(value: str | None, *, limit: int = 900) -> str | None:
     return compact[: max(0, limit - 3)].rstrip() + "..."
 
 
+def _dedupe_text_variants(values: list[str | None]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = clean_text(value or "")
+        if len(cleaned) < 5:
+            continue
+        normalized = cleaned.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(cleaned)
+    return ordered
+
+
+def _merge_retrieved_result_sets(
+    result_sets: list[list[tuple[Any, float]]],
+    *,
+    limit: int,
+) -> list[tuple[Any, float]]:
+    merged: dict[str, tuple[Any, float]] = {}
+    for result_set in result_sets:
+        for source, score in result_set:
+            source_id = str(getattr(source, "id", ""))
+            if not source_id:
+                continue
+            existing = merged.get(source_id)
+            if existing is None or float(score) > float(existing[1]):
+                merged[source_id] = (source, float(score))
+    ordered = sorted(merged.values(), key=lambda item: item[1], reverse=True)
+    return ordered[:limit]
+
+
 def _live_stage_payload(stage_key: str, *, message: str | None = None) -> dict[str, Any]:
     stage = LIVE_STAGE_METADATA.get(stage_key, LIVE_STAGE_METADATA["queued"])
     return {
@@ -1339,6 +1372,9 @@ async def _pipeline_from_text(
             cache_key=hash_value,
         )
         flat_queries = query_generation.search_queries
+        english_retrieval_query = clean_text(str(query_metadata.get("english_query") or "")) or None
+        retrieval_variants = _dedupe_text_variants([retrieval_query, english_retrieval_query])
+        retrieval_match_query = english_retrieval_query or retrieval_query
         logger.info(
             "pipeline_stage stage=query_generation duration_ms=%.1f query_count=%d queries=%s",
             (time.perf_counter() - stage_start) * 1000,
@@ -1354,6 +1390,7 @@ async def _pipeline_from_text(
                 "search_queries": [str(query) for query in flat_queries[:8]],
                 "query_model": query_metadata.get("model"),
                 "query_cached": query_metadata.get("cached", False),
+                "cross_lingual_query": _preview_text(english_retrieval_query, limit=180),
             },
         )
         _append_live_event(
@@ -1590,21 +1627,30 @@ async def _pipeline_from_text(
             "message": evidence_index.message,
         }
 
-        embedding = await embed_text(
-            retrieval_query,
-            task_type="RETRIEVAL_QUERY",
+        retrieved_result_sets: list[list[tuple[Any, float]]] = []
+        for query_variant in retrieval_variants:
+            embedding = await embed_text(
+                query_variant,
+                task_type="RETRIEVAL_QUERY",
+            )
+            retrieved_result_sets.append(
+                await retrieve_evidence(session, embedding, top_k=settings.pgvector_top_k)
+            )
+        retrieved = _merge_retrieved_result_sets(
+            retrieved_result_sets,
+            limit=max(settings.pgvector_top_k, settings.pgvector_top_k * len(retrieval_variants)),
         )
-        retrieved = await retrieve_evidence(session, embedding, top_k=settings.pgvector_top_k)
-        retrieved_candidates = _build_evidence_candidates(retrieved, claim_text=retrieval_query)
-        selected_evidence, rerank_metadata = await rerank_evidence(retrieval_query, retrieved_candidates)
+        retrieved_candidates = _build_evidence_candidates(retrieved, claim_text=retrieval_match_query)
+        selected_evidence, rerank_metadata = await rerank_evidence(retrieval_match_query, retrieved_candidates)
         selected_evidence = _filter_selected_evidence(selected_evidence)
         logger.info(
             "pipeline_stage stage=pgvector_retrieval duration_ms=%.1f "
-            "retrieved=%d selected=%d rerank_applied=%s",
+            "retrieved=%d selected=%d rerank_applied=%s variants=%d",
             (time.perf_counter() - stage_start) * 1000,
             len(retrieved_candidates),
             len(selected_evidence),
             rerank_metadata.get("applied"),
+            len(retrieval_variants),
         )
         _merge_live_details(
             live_status,
@@ -1615,6 +1661,7 @@ async def _pipeline_from_text(
                 "pgvector_candidates": len(retrieved_candidates),
                 "selected_evidence_count": len(selected_evidence),
                 "selected_evidence": _evidence_preview(selected_evidence),
+                "retrieval_variant_count": len(retrieval_variants),
             },
         )
         _merge_live_details(
@@ -1766,6 +1813,8 @@ async def _pipeline_from_text(
             "nvidia_reasoning_model": reasoning_model if reasoning_provider == "nvidia" else None,
             "claim_extraction": {
                 "query_used_for_retrieval": retrieval_query,
+                "retrieval_match_query": retrieval_match_query,
+                "retrieval_variants": retrieval_variants,
                 "entities": extraction.entities,
                 "time_context": extraction.time_context,
                 "location_context": extraction.location_context,
@@ -1776,6 +1825,7 @@ async def _pipeline_from_text(
             "search_query_generation": {
                 "queries": [q.model_dump() for q in query_generation.queries],
                 "search_queries": flat_queries,
+                "english_query": english_retrieval_query,
                 "call_count": int(query_metadata.get("call_count", 0)),
             },
             "search_answer_context": live_evidence.get("search_answer_context"),

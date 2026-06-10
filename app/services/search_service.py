@@ -195,6 +195,36 @@ def _search_overlap_score(claim_tokens: set[str], result: NormalizedSearchResult
     return min(1.0, len(claim_tokens & result_tokens) / len(claim_tokens))
 
 
+def _claim_token_sets(primary_claim_text: str, claim_texts: list[str] | None = None) -> list[set[str]]:
+    ordered_texts: list[str] = []
+    seen: set[str] = set()
+    for value in [primary_claim_text, *(claim_texts or [])]:
+        cleaned = clean_text(value)
+        if len(cleaned) < 5:
+            continue
+        normalized = cleaned.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered_texts.append(cleaned)
+
+    token_sets: list[set[str]] = []
+    for text in ordered_texts:
+        tokens = _search_tokens(text)
+        if tokens:
+            token_sets.append(tokens)
+    return token_sets
+
+
+def _max_search_overlap_score(
+    claim_token_sets: list[set[str]],
+    result: NormalizedSearchResult,
+) -> float:
+    if not claim_token_sets:
+        return 0.0
+    return max(_search_overlap_score(claim_tokens, result) for claim_tokens in claim_token_sets)
+
+
 def _normalized_result_search_score(result: NormalizedSearchResult) -> float:
     try:
         score = float(result.search_score or 0.0)
@@ -210,6 +240,7 @@ def select_reliable_matching_results(
     *,
     claim_text: str,
     limit: int,
+    claim_texts: list[str] | None = None,
 ) -> list[NormalizedSearchResult]:
     """
     Prefer results that both match the claim text and come from trusted domains.
@@ -217,10 +248,10 @@ def select_reliable_matching_results(
     If strict matching/trust would leave too few sources, this gracefully falls
     back to the best remaining Tavily results instead of returning an empty set.
     """
-    claim_tokens = _search_tokens(clean_text(claim_text))
+    claim_token_sets = _claim_token_sets(claim_text, claim_texts)
     scored: list[tuple[float, float, float, NormalizedSearchResult]] = []
     for result in results:
-        overlap = _search_overlap_score(claim_tokens, result)
+        overlap = _max_search_overlap_score(claim_token_sets, result)
         search_score = _normalized_result_search_score(result)
         trust_score = max(0.0, min(1.0, float(result.trust_score or 0.5)))
         full_content_bonus = 0.05 if result.content and len(result.content) >= MIN_TAVILY_CONTENT_CHARACTERS else 0.0

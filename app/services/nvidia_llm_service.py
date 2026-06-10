@@ -284,6 +284,13 @@ REASONING_RESPONSE_SCHEMA: dict[str, Any] = {
         "warnings",
     ],
 }
+ENGLISH_SEARCH_QUERY_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "english_query": {"type": "string"},
+    },
+    "required": ["english_query"],
+}
 
 
 # ── Helper utilities ──────────────────────────────────────────────────────────
@@ -301,6 +308,122 @@ def _dedupe_queries(values: list[str]) -> list[str]:
         seen.add(normalized)
         queries.append(query)
     return queries[:6]
+
+
+def _needs_english_search_companion(extraction: ClaimExtractionSchema) -> bool:
+    claim_text = clean_text(extraction.extracted_claim or "")
+    if len(claim_text) < 5:
+        return False
+    return True
+
+
+def _english_search_query_cache_task(model: str | None) -> str:
+    return f"{NVIDIAModelTask.SEARCH_QUERY_GENERATION.value}:english_companion:{model}"
+
+
+def _finalize_search_queries(
+    *,
+    extraction: ClaimExtractionSchema,
+    parsed_queries: list[SearchQuerySchema],
+    english_companion: str | None = None,
+) -> SearchQueryGenerationSchema:
+    ordered_candidates: list[SearchQuerySchema] = []
+    if english_companion:
+        ordered_candidates.append(
+            SearchQuerySchema(query=english_companion, purpose="general", priority=1)
+        )
+    if extraction.extracted_claim:
+        ordered_candidates.append(
+            SearchQuerySchema(query=extraction.extracted_claim, purpose="general", priority=2)
+        )
+    ordered_candidates.extend(parsed_queries)
+
+    seen: set[str] = set()
+    deduped: list[SearchQuerySchema] = []
+    for item in ordered_candidates:
+        normalized = clean_text(item.query).lower()
+        if len(normalized) < 5 or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(
+            SearchQuerySchema(
+                query=clean_text(item.query),
+                purpose=item.purpose if item.purpose in ALLOWED_QUERY_PURPOSES else "general",
+                priority=len(deduped) + 1,
+            )
+        )
+        if len(deduped) >= 6:
+            break
+
+    flat_queries = [item.query for item in deduped]
+    return SearchQueryGenerationSchema(queries=deduped, search_queries=flat_queries)
+
+
+async def _build_english_search_companion(
+    *,
+    extraction: ClaimExtractionSchema,
+    original_text: str,
+    cache_key: str | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    if not _needs_english_search_companion(extraction):
+        return None, {"model": None, "call_count": 0, "cached": False}
+
+    model = settings.active_gemini_claim_extraction_model
+    if not settings.gemini_claim_extraction_enabled or not model:
+        return None, {"model": model, "call_count": 0, "cached": False}
+
+    cache_task = _english_search_query_cache_task(model)
+    if cache_key:
+        cached_payload = await cache_service.get_ai_task_payload(cache_task, cache_key)
+        if isinstance(cached_payload, dict):
+            cached_query = clean_text(str(cached_payload.get("english_query") or ""))
+            if len(cached_query) >= 5:
+                return cached_query, {"model": model, "call_count": 0, "cached": True}
+
+    user_prompt = (
+        "Convert this claim into one concise English search query for fact-check and trusted-source retrieval.\n\n"
+        "Rules:\n"
+        "- Preserve the exact factual meaning.\n"
+        "- Preserve named entities, numbers, dates, locations, tense, and negation.\n"
+        "- Transliterate names and places into standard English spellings when needed.\n"
+        "- If the English wording is awkward, broken, overly literal, or translated, rewrite it into natural source-friendly English without changing the meaning.\n"
+        "- Prefer the canonical event, title, office, tournament, or legal term used by reliable sources.\n"
+        "- For historical participation, winners, finalists, records, firsts, appointments, and similar status claims, phrase the query in a way that helps trusted sources confirm or refute it directly.\n"
+        "- Keep it short and high-signal.\n"
+        "- Return JSON only.\n\n"
+        f"Detected language:\n{extraction.detected_language}\n\n"
+        f"Extracted claim:\n{extraction.extracted_claim}\n\n"
+        f"Original user input:\n{original_text}\n"
+    )
+
+    try:
+        content = await call_gemini_generate_content(
+            system_instruction=(
+                "You create a single canonical English retrieval query for JachAI.\n"
+                "The query should maximize matching with reliable news, official, encyclopedic, and fact-check sources while preserving the claim's exact meaning.\n"
+                "Return strict JSON only in the form {\"english_query\": \"string\"}."
+            ),
+            user_content=user_prompt,
+            model=model,
+            response_mime_type="application/json",
+            response_schema=ENGLISH_SEARCH_QUERY_RESPONSE_SCHEMA,
+            max_output_tokens=120,
+            purpose="search_query_translation",
+        )
+        payload = load_json_with_repair(content or "{}")
+        english_query = clean_text(str(payload.get("english_query") or ""))
+        if len(english_query) < 5:
+            return None, {"model": model, "call_count": 1, "cached": False}
+        if cache_key:
+            await cache_service.set_ai_task_payload(
+                cache_task,
+                cache_key,
+                {"english_query": english_query},
+            )
+        return english_query, {"model": model, "call_count": 1, "cached": False}
+    except Exception:
+        logger.exception("english_search_query_generation_failed")
+        return None, {"model": model, "call_count": 1, "cached": False}
 
 
 def _confidence_label_from_score(score: Any) -> str:
@@ -608,10 +731,15 @@ def fallback_search_queries(
     *,
     extraction: ClaimExtractionSchema,
     original_text: str,
+    english_companion: str | None = None,
 ) -> SearchQueryGenerationSchema:
-    flat = _dedupe_queries([extraction.extracted_claim, original_text])
+    flat = _dedupe_queries([english_companion or "", extraction.extracted_claim, original_text])
     queries = [SearchQuerySchema(query=q, purpose="general", priority=i + 1) for i, q in enumerate(flat)]
-    return SearchQueryGenerationSchema(queries=queries, search_queries=flat)
+    return _finalize_search_queries(
+        extraction=extraction,
+        parsed_queries=queries,
+        english_companion=english_companion,
+    )
 
 
 def fallback_claim_extraction(
@@ -758,21 +886,51 @@ async def generate_search_queries(
     cache_key: str | None = None,
 ) -> tuple[SearchQueryGenerationSchema, dict[str, Any]]:
     model = get_model_for_task(NVIDIAModelTask.SEARCH_QUERY_GENERATION)
-    fallback = fallback_search_queries(extraction=extraction, original_text=original_text)
+    english_companion, english_query_metadata = await _build_english_search_companion(
+        extraction=extraction,
+        original_text=original_text,
+        cache_key=cache_key,
+    )
+    fallback = fallback_search_queries(
+        extraction=extraction,
+        original_text=original_text,
+        english_companion=english_companion,
+    )
     if not settings.nvidia_api_key:
-        return fallback, {"model": model, "call_count": 0}
+        return fallback, {
+            "model": model,
+            "call_count": 0,
+            "english_query": english_companion,
+            "english_query_model": english_query_metadata.get("model"),
+            "english_query_cached": english_query_metadata.get("cached", False),
+        }
     if not model:
-        return fallback, {"model": None, "call_count": 0}
+        return fallback, {
+            "model": None,
+            "call_count": 0,
+            "english_query": english_companion,
+            "english_query_model": english_query_metadata.get("model"),
+            "english_query_cached": english_query_metadata.get("cached", False),
+        }
 
     cache_task = f"{NVIDIAModelTask.SEARCH_QUERY_GENERATION.value}:{model}"
     if cache_key:
         cached_payload = await cache_service.get_ai_task_payload(cache_task, cache_key)
         if cached_payload:
             try:
-                return SearchQueryGenerationSchema.model_validate(cached_payload), {
+                cached_result = SearchQueryGenerationSchema.model_validate(cached_payload)
+                finalized_cached = _finalize_search_queries(
+                    extraction=extraction,
+                    parsed_queries=cached_result.queries,
+                    english_companion=english_companion,
+                )
+                return finalized_cached, {
                     "model": model,
                     "call_count": 0,
                     "cached": True,
+                    "english_query": english_companion,
+                    "english_query_model": english_query_metadata.get("model"),
+                    "english_query_cached": english_query_metadata.get("cached", False),
                 }
             except Exception:
                 logger.warning("cached_search_queries_invalid cache_key=%s", cache_key)
@@ -833,24 +991,31 @@ async def generate_search_queries(
                         parsed_queries.append(SearchQuerySchema(query=q, purpose="general", priority=1))
 
         if not parsed_queries:
-            return fallback, {"model": model, "call_count": 1, "cached": False}
+            return fallback, {
+                "model": model,
+                "call_count": 1,
+                "cached": False,
+                "english_query": english_companion,
+                "english_query_model": english_query_metadata.get("model"),
+                "english_query_cached": english_query_metadata.get("cached", False),
+            }
 
-        # Sort by priority, dedupe by query text
         parsed_queries.sort(key=lambda x: x.priority)
-        seen: set[str] = set()
-        deduped: list[SearchQuerySchema] = []
-        for q in parsed_queries:
-            normalized = q.query.lower()
-            if normalized not in seen:
-                seen.add(normalized)
-                deduped.append(q)
-        deduped = deduped[:6]
-
-        flat_queries = [q.query for q in deduped]
-        result = SearchQueryGenerationSchema(queries=deduped, search_queries=flat_queries)
+        result = _finalize_search_queries(
+            extraction=extraction,
+            parsed_queries=parsed_queries,
+            english_companion=english_companion,
+        )
         if cache_key:
             await cache_service.set_ai_task_payload(cache_task, cache_key, result.model_dump(mode="json"))
-        return result, {"model": model, "call_count": 1, "cached": False}
+        return result, {
+            "model": model,
+            "call_count": 1,
+            "cached": False,
+            "english_query": english_companion,
+            "english_query_model": english_query_metadata.get("model"),
+            "english_query_cached": english_query_metadata.get("cached", False),
+        }
     except Exception:
         logger.exception("nvidia_search_query_generation_failed")
 
@@ -858,6 +1023,9 @@ async def generate_search_queries(
         "model": model,
         "call_count": 1 if attempted_call else 0,
         "cached": False,
+        "english_query": english_companion,
+        "english_query_model": english_query_metadata.get("model"),
+        "english_query_cached": english_query_metadata.get("cached", False),
     }
 
 

@@ -359,11 +359,104 @@ class TestQueryGeneration:
         assert len(result.queries) >= 1
         assert result.queries[0].purpose in {"general", "official", "refutation", "recent", "background"}
 
+    def test_fallback_queries_keep_english_companion_for_non_english_claims(self):
+        from app.schemas.verdict_schema import ClaimExtractionSchema
+        from app.services.nvidia_llm_service import fallback_search_queries
+
+        extraction = ClaimExtractionSchema(
+            extracted_claim="ऑस्ट्रेलिया ने कल शेर-ए-बांग्ला स्टेडियम, मीरपुर में बांग्लादेश को हराया।",
+            detected_language="Hindi",
+            category="Other",
+        )
+
+        result = fallback_search_queries(
+            extraction=extraction,
+            original_text="ऑस्ट्रेलिया ने कल शेर-ए-बांग्ला स्टेडियम, मीरपुर में बांग्लादेश को हराया।",
+            english_companion="Australia beat Bangladesh yesterday at Sher-e-Bangla Stadium, Mirpur",
+        )
+
+        assert result.search_queries[0] == "Australia beat Bangladesh yesterday at Sher-e-Bangla Stadium, Mirpur"
+        assert extraction.extracted_claim in result.search_queries
+
     def test_query_schema_has_purpose_field(self):
         from app.schemas.verdict_schema import SearchQuerySchema
         q = SearchQuerySchema(query="vaccines autism site:who.int", purpose="official", priority=1)
         assert q.purpose == "official"
         assert q.priority == 1
+
+    @pytest.mark.asyncio
+    async def test_generate_search_queries_adds_english_companion_for_hindi_claim(self):
+        from app.schemas.verdict_schema import ClaimExtractionSchema
+        from app.services.nvidia_llm_service import generate_search_queries
+
+        extraction = ClaimExtractionSchema(
+            extracted_claim="ऑस्ट्रेलिया ने कल शेर-ए-बांग्ला स्टेडियम, मीरपुर में बांग्लादेश को हराया।",
+            detected_language="Hindi",
+            category="Other",
+        )
+
+        with patch("app.services.nvidia_llm_service.settings") as mock_settings:
+            mock_settings.nvidia_api_key = ""
+            mock_settings.gemini_claim_extraction_enabled = True
+            mock_settings.active_gemini_claim_extraction_model = "gemini-3.1-flash-lite"
+            with patch(
+                "app.services.nvidia_llm_service.call_gemini_generate_content",
+                new_callable=AsyncMock,
+                return_value=json.dumps(
+                    {
+                        "english_query": "Australia beat Bangladesh yesterday at Sher-e-Bangla Stadium, Mirpur",
+                    }
+                ),
+            ):
+                with patch(
+                    "app.services.nvidia_llm_service.get_model_for_task",
+                    return_value=None,
+                ):
+                    result, meta = await generate_search_queries(
+                        extraction=extraction,
+                        original_text=extraction.extracted_claim,
+                    )
+
+        assert "Australia beat Bangladesh yesterday at Sher-e-Bangla Stadium, Mirpur" in result.search_queries
+        assert extraction.extracted_claim in result.search_queries
+        assert meta["english_query"] == "Australia beat Bangladesh yesterday at Sher-e-Bangla Stadium, Mirpur"
+
+    @pytest.mark.asyncio
+    async def test_generate_search_queries_adds_canonical_english_companion_for_english_claim(self):
+        from app.schemas.verdict_schema import ClaimExtractionSchema
+        from app.services.nvidia_llm_service import generate_search_queries
+
+        extraction = ClaimExtractionSchema(
+            extracted_claim="Bangladesh is the Fifa world cups finalist",
+            detected_language="English",
+            category="Other",
+        )
+
+        with patch("app.services.nvidia_llm_service.settings") as mock_settings:
+            mock_settings.nvidia_api_key = ""
+            mock_settings.gemini_claim_extraction_enabled = True
+            mock_settings.active_gemini_claim_extraction_model = "gemini-3.1-flash-lite"
+            with patch(
+                "app.services.nvidia_llm_service.call_gemini_generate_content",
+                new_callable=AsyncMock,
+                return_value=json.dumps(
+                    {
+                        "english_query": "Has Bangladesh ever reached the FIFA World Cup final",
+                    }
+                ),
+            ):
+                with patch(
+                    "app.services.nvidia_llm_service.get_model_for_task",
+                    return_value=None,
+                ):
+                    result, meta = await generate_search_queries(
+                        extraction=extraction,
+                        original_text=extraction.extracted_claim,
+                    )
+
+        assert result.search_queries[0] == "Has Bangladesh ever reached the FIFA World Cup final"
+        assert "Bangladesh is the Fifa world cups finalist" in result.search_queries
+        assert meta["english_query"] == "Has Bangladesh ever reached the FIFA World Cup final"
 
 
 # ── 4. Tavily search ──────────────────────────────────────────────────────────
@@ -392,6 +485,40 @@ class TestTavilySearch:
         deduped = dedupe_search_results([r1, r2])
         assert len(deduped) == 1
         assert deduped[0].search_score == 0.8  # higher score kept
+
+    def test_select_reliable_matching_results_uses_cross_language_query_variants(self):
+        from app.services.search_service import NormalizedSearchResult, select_reliable_matching_results
+
+        hindi_claim = "ऑस्ट्रेलिया ने कल शेर-ए-बांग्ला स्टेडियम, मीरपुर में बांग्लादेश को हराया।"
+        english_query = "Australia beat Bangladesh yesterday at Sher-e-Bangla Stadium Mirpur"
+
+        unrelated = NormalizedSearchResult(
+            query="random cricket update",
+            title="Cricket news roundup",
+            url="https://reuters.com/cricket-roundup",
+            content="General cricket roundup from around the world.",
+            search_score=0.95,
+            domain="reuters.com",
+            trust_score=0.92,
+        )
+        matching = NormalizedSearchResult(
+            query=english_query,
+            title="Bangladesh beat Australia in first ODI in Mirpur - BBC Sport",
+            url="https://bbc.com/sport/cricket/mirpur-odi",
+            content="Bangladesh sealed an 86-run win over Australia in Mirpur.",
+            search_score=0.86,
+            domain="bbc.com",
+            trust_score=0.90,
+        )
+
+        selected = select_reliable_matching_results(
+            [unrelated, matching],
+            claim_text=hindi_claim,
+            claim_texts=[hindi_claim, english_query],
+            limit=1,
+        )
+
+        assert selected[0].url == "https://bbc.com/sport/cricket/mirpur-odi"
 
 
 # ── 5. Evidence fetching ──────────────────────────────────────────────────────
