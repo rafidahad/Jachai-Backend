@@ -1632,6 +1632,13 @@ async def _pipeline_from_text(
             retrieval_variants,
             task_type="RETRIEVAL_QUERY",
         )
+        embedding_by_query = {
+            query: embedding
+            for query, embedding in zip(retrieval_variants, query_embeddings, strict=True)
+        }
+        semantic_cluster_embedding = embedding_by_query.get(retrieval_match_query)
+        if semantic_cluster_embedding is None and query_embeddings:
+            semantic_cluster_embedding = query_embeddings[0]
         for embedding in query_embeddings:
             retrieved_result_sets.append(
                 await retrieve_evidence(session, embedding, top_k=settings.pgvector_top_k)
@@ -1830,6 +1837,10 @@ async def _pipeline_from_text(
             },
             "search_answer_context": live_evidence.get("search_answer_context"),
             "search_provider": "tavily",
+            "semantic_cluster_text": retrieval_match_query,
+            "semantic_cluster_embedding": [
+                float(value) for value in (semantic_cluster_embedding or [])
+            ],
             "retrieval": {
                 "candidate_count": len(retrieved_candidates),
                 "selected_count": len(selected_evidence),
@@ -1870,6 +1881,8 @@ async def _pipeline_from_text(
             title=verdict.extracted_claim[:120],
             language=verdict.detected_language,
             summary=verdict.user_response,
+            semantic_text=retrieval_match_query,
+            semantic_embedding=semantic_cluster_embedding,
         )
 
         claim = Claim(
