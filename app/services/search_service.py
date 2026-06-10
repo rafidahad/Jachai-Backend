@@ -420,12 +420,12 @@ def dedupe_search_results(results: list[NormalizedSearchResult]) -> list[Normali
     return ordered
 
 
-async def search_with_tavily(query: str) -> TavilySearchResponse:
-    api_key = settings.active_tavily_api_key
-    if not settings.tavily_enabled or not api_key:
-        return TavilySearchResponse(query=query)
-
-    timeout = min(settings.request_timeout_seconds, settings.live_evidence_timeout_seconds)
+async def _execute_tavily_search(
+    client: httpx.AsyncClient,
+    *,
+    query: str,
+    api_key: str,
+) -> TavilySearchResponse:
     payload = {
         "query": query,
         "search_depth": settings.tavily_search_depth,
@@ -440,11 +440,34 @@ async def search_with_tavily(query: str) -> TavilySearchResponse:
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+    response = await client.post(TAVILY_SEARCH_ENDPOINT, json=payload, headers=headers)
+    response.raise_for_status()
+    return TavilySearchResponse.model_validate(response.json())
 
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        response = await client.post(TAVILY_SEARCH_ENDPOINT, json=payload, headers=headers)
-        response.raise_for_status()
-        return TavilySearchResponse.model_validate(response.json())
+
+async def search_with_tavily(
+    query: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> TavilySearchResponse:
+    api_key = settings.active_tavily_api_key
+    if not settings.tavily_enabled or not api_key:
+        return TavilySearchResponse(query=query)
+
+    timeout = min(settings.request_timeout_seconds, settings.live_evidence_timeout_seconds)
+    if client is not None:
+        return await _execute_tavily_search(
+            client,
+            query=query,
+            api_key=api_key,
+        )
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as owned_client:
+        return await _execute_tavily_search(
+            owned_client,
+            query=query,
+            api_key=api_key,
+        )
 
 
 async def search_general_web(query: str, *, language: str | None = None) -> list[NormalizedSearchResult]:

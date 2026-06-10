@@ -525,6 +525,36 @@ class TestTavilySearch:
 
 class TestEvidenceFetching:
     @pytest.mark.asyncio
+    async def test_read_capped_response_bytes_stops_at_limit(self):
+        from app.services.live_evidence_service import _read_capped_response_bytes
+
+        class _FakeResponse:
+            async def aiter_bytes(self):
+                for chunk in (b"abc", b"def", b"ghi"):
+                    yield chunk
+
+        body = await _read_capped_response_bytes(_FakeResponse(), max_bytes=5)
+
+        assert body == b"abcde"
+
+    @pytest.mark.asyncio
+    async def test_run_tavily_queries_reuses_single_http_client(self):
+        from app.services.live_evidence_service import _run_tavily_queries
+        from app.services.search_service import TavilySearchResponse
+
+        async def fake_search(query: str, *, client=None):
+            assert client is not None
+            return TavilySearchResponse(query=query)
+
+        with patch("app.services.live_evidence_service.search_with_tavily", side_effect=fake_search) as mock_search:
+            responses, errors = await _run_tavily_queries(["one", "two", "three"])
+
+        clients = [call.kwargs["client"] for call in mock_search.await_args_list]
+        assert len({id(client) for client in clients}) == 1
+        assert [response.query for response in responses] == ["one", "two", "three"]
+        assert errors == []
+
+    @pytest.mark.asyncio
     async def test_failed_url_does_not_crash_pipeline(self):
         """A single URL fetch failure should produce a snippet_fallback, not crash."""
         from app.services.search_service import NormalizedSearchResult
@@ -542,8 +572,10 @@ class TestEvidenceFetching:
             trust_score=0.5,
         )
 
-        mock_client = AsyncMock()
-        mock_client.get.side_effect = httpx.ConnectError("Connection refused")
+        mock_client = MagicMock()
+        stream_context = AsyncMock()
+        stream_context.__aenter__.side_effect = httpx.ConnectError("Connection refused")
+        mock_client.stream.return_value = stream_context
 
         doc = await _document_from_search_result(
             mock_client,
