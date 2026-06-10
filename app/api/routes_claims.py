@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.rate_limit import claim_submission_rate_limit
-from app.core.security import verify_internal_api_key
+from app.core.security import require_admin_session
 from app.db.session import get_db
 from app.schemas.claim_schema import (
     ClaimListResponseSchema,
@@ -144,7 +144,7 @@ async def claim_share_summary(
 @router.patch(
     "/{claim_id}/review-status",
     response_model=ClaimLookupResponseSchema,
-    dependencies=[Depends(verify_internal_api_key)],
+    dependencies=[Depends(require_admin_session)],
 )
 async def patch_review_status(
     claim_id: str,
@@ -157,7 +157,7 @@ async def patch_review_status(
     return ClaimLookupResponseSchema(claim=claim)
 
 
-@router.get("", response_model=ClaimListResponseSchema)
+@router.get("", response_model=ClaimListResponseSchema, dependencies=[Depends(require_admin_session)])
 async def list_claims_endpoint(
     verdict: str | None = None,
     language: str | None = None,

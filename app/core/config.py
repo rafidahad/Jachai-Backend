@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+BASE_DIR = Path(__file__).resolve().parents[2]
+ENV_FILE_PATH = BASE_DIR / ".env"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(ENV_FILE_PATH),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -98,6 +102,17 @@ class Settings(BaseSettings):
     )
     embedding_device: str = Field(default="cpu", validation_alias=AliasChoices("EMBEDDING_DEVICE"))
     internal_api_key: str = Field(validation_alias=AliasChoices("INTERNAL_API_KEY"))
+    admin_username: str | None = Field(default=None, validation_alias=AliasChoices("ADMIN_USERNAME"))
+    admin_password: str | None = Field(default=None, validation_alias=AliasChoices("ADMIN_PASSWORD"))
+    admin_auth_secret: str | None = Field(default=None, validation_alias=AliasChoices("ADMIN_AUTH_SECRET"))
+    admin_session_cookie_name: str = Field(
+        default="jachai_admin_session",
+        validation_alias=AliasChoices("ADMIN_SESSION_COOKIE_NAME"),
+    )
+    admin_session_ttl_seconds: int = Field(
+        default=60 * 60 * 12,
+        validation_alias=AliasChoices("ADMIN_SESSION_TTL_SECONDS"),
+    )
     backend_cors_origins: Annotated[list[str], NoDecode] = Field(
         default_factory=list,
         validation_alias=AliasChoices("BACKEND_CORS_ORIGINS", "CORS_ORIGINS"),
@@ -400,6 +415,14 @@ class Settings(BaseSettings):
     def embedding_uses_gemini(self) -> bool:
         normalized = self.embedding_model.strip().lower()
         return normalized.startswith("gemini-embedding-")
+
+    @property
+    def admin_auth_enabled(self) -> bool:
+        return bool(
+            (self.admin_username or "").strip()
+            and (self.admin_password or "").strip()
+            and (self.admin_auth_secret or "").strip()
+        )
 
 
 @lru_cache(maxsize=1)

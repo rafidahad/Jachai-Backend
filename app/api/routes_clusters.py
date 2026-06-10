@@ -3,12 +3,13 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import require_admin_session
 from app.db.session import get_db
 from app.schemas.cluster_schema import RumorClusterDetailResponseSchema, RumorClusterListResponseSchema
 from app.services.cluster_service import get_cluster_detail, list_clusters
 from app.utils.errors import AppError
 
-router = APIRouter(prefix="/rumor-clusters", tags=["rumor-clusters"])
+router = APIRouter(prefix="/rumor-clusters", tags=["rumor-clusters"], dependencies=[Depends(require_admin_session)])
 
 
 @router.get("", response_model=RumorClusterListResponseSchema)

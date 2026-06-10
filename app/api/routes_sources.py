@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import verify_internal_api_key
+from app.core.security import require_admin_session
 from app.db.session import get_db
 from app.schemas.source_schema import (
     SourceIngestRequestSchema,
@@ -14,14 +14,10 @@ from app.schemas.source_schema import (
 from app.services.source_service import get_source, ingest_sources, list_sources
 from app.utils.errors import AppError
 
-router = APIRouter(prefix="/sources", tags=["sources"])
+router = APIRouter(prefix="/sources", tags=["sources"], dependencies=[Depends(require_admin_session)])
 
 
-@router.post(
-    "/ingest",
-    response_model=SourceIngestResponseSchema,
-    dependencies=[Depends(verify_internal_api_key)],
-)
+@router.post("/ingest", response_model=SourceIngestResponseSchema)
 async def ingest_sources_endpoint(
     payload: SourceIngestRequestSchema,
     session: AsyncSession = Depends(get_db),
