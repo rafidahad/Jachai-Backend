@@ -8,6 +8,19 @@ from app.core.redis import get_redis
 
 
 class CacheService:
+    async def get_json_payload(self, key: str) -> dict[str, Any] | None:
+        redis = await get_redis()
+        payload = await redis.get(key)
+        return json.loads(payload) if payload else None
+
+    async def set_json_payload(self, key: str, payload: dict[str, Any], ttl_seconds: int) -> None:
+        redis = await get_redis()
+        await redis.setex(
+            key,
+            ttl_seconds,
+            json.dumps(payload, default=str),
+        )
+
     async def get_duplicate_claim_id(self, normalized_hash: str) -> str | None:
         redis = await get_redis()
         return await redis.get(f"claim:duplicate:{normalized_hash}")
