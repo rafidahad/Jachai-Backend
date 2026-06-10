@@ -31,6 +31,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     SENTENCE_TRANSFORMERS_HOME=/data/sentence-transformers
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
