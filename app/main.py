@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.core.database import close_database, init_database
 from app.core.logging import configure_logging, get_logger
 from app.core.redis import close_redis, init_redis
+from app.services.health_service import get_runtime_readiness
 from app.utils.errors import AppError
 
 configure_logging()
@@ -50,6 +51,16 @@ app.include_router(api_router)
 @app.get("/health", tags=["health"])
 async def root_health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/readyz", tags=["health"])
+async def readiness_health(response: Response) -> dict[str, object]:
+    ready, checks = await get_runtime_readiness()
+    response.status_code = 200 if ready else 503
+    return {
+        "status": "ready" if ready else "not_ready",
+        "checks": checks,
+    }
 
 
 @app.exception_handler(AppError)

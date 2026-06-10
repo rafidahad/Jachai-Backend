@@ -14,10 +14,10 @@ FastAPI backend for JachAI, a trilingual and multimodal misinformation verificat
 ## Quick Start
 
 1. Copy `.env.example` to `.env` and fill in your Neon, Redis, and NVIDIA credentials.
-2. Enable extensions in your database:
+2. Bootstrap the database schema once:
 
-```sql
-\i scripts/init_db.sql
+```bash
+uv run python scripts/bootstrap_db.py
 ```
 
 3. Install dependencies and run the app:
@@ -39,6 +39,7 @@ The API will be available at `http://127.0.0.1:8000`, with docs at `/docs`.
 ## Selected Endpoints
 
 - `GET /health`
+- `GET /readyz`
 - `GET /api/v1/health/system`
 - `POST /api/v1/claims/text`
 - `POST /api/v1/claims/image`

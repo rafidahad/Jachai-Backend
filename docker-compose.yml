@@ -11,6 +11,8 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-production}
       DEBUG: ${DEBUG:-false}
+      AUTO_CREATE_TABLES: ${AUTO_CREATE_TABLES:-false}
+      BOOTSTRAP_DATABASE_ON_STARTUP: ${BOOTSTRAP_DATABASE_ON_STARTUP:-false}
       # This compose file assumes PostgreSQL and Redis are already running
       # and are provided through DATABASE_URL / REDIS_URL in backend/.env.
       UVICORN_HOST: 0.0.0.0
@@ -21,6 +23,8 @@ services:
       WAIT_TIMEOUT_SECONDS: ${WAIT_TIMEOUT_SECONDS:-75}
       HF_HOME: /data/huggingface
       SENTENCE_TRANSFORMERS_HOME: /data/sentence-transformers
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "${BACKEND_BIND_ADDRESS:-127.0.0.1}:${BACKEND_PORT:-8000}:8000"
     volumes:
@@ -31,9 +35,9 @@ services:
       test:
         [
           "CMD-SHELL",
-          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)\"",
+          "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5)\"",
         ]
-      interval: 30s
+      interval: 15s
       timeout: 10s
       retries: 5
       start_period: 40s

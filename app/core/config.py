@@ -118,7 +118,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("BACKEND_CORS_ORIGINS", "CORS_ORIGINS"),
     )
     log_level: str = "INFO"
-    auto_create_tables: bool = True
+    auto_create_tables: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("AUTO_CREATE_TABLES"),
+    )
+    bootstrap_database_on_startup: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("BOOTSTRAP_DATABASE_ON_STARTUP", "DB_BOOTSTRAP_ON_STARTUP"),
+    )
     result_cache_ttl_seconds: int = Field(
         default=60 * 60 * 24,
         validation_alias=AliasChoices("RESULT_CACHE_TTL_SECONDS", "CLAIM_CACHE_TTL_SECONDS"),
@@ -295,6 +302,8 @@ class Settings(BaseSettings):
         "tavily_include_images",
         "live_evidence_enabled",
         "enable_debug_output",
+        "auto_create_tables",
+        "bootstrap_database_on_startup",
         mode="before",
     )
     @classmethod

@@ -27,6 +27,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH=/opt/venv/bin:$PATH \
     PYTHONPATH=/app \
+    HOME=/home/jachai \
     HF_HOME=/data/huggingface \
     SENTENCE_TRANSFORMERS_HOME=/data/sentence-transformers
 
@@ -35,13 +36,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
+RUN groupadd --system --gid 10001 jachai \
+    && useradd --system --uid 10001 --gid 10001 --create-home --home-dir /home/jachai jachai \
+    && mkdir -p /app /data \
+    && chown -R jachai:jachai /app /data
+
 WORKDIR /app
 
-COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /app /app
+COPY --from=builder --chown=jachai:jachai /opt/venv /opt/venv
+COPY --from=builder --chown=jachai:jachai /app /app
 
 RUN chmod +x /app/docker/entrypoint.sh
 
 EXPOSE 8000
+
+USER jachai
 
 ENTRYPOINT ["/app/docker/entrypoint.sh"]

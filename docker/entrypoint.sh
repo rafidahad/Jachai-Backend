@@ -2,7 +2,7 @@
 set -eu
 
 wait_for_services() {
-  python - <<'PY'
+  python3 - <<'PY'
 import os
 import socket
 import time
@@ -50,6 +50,10 @@ case "${WAIT_FOR_SERVICES:-true}" in
     wait_for_services
     ;;
 esac
+
+if [ "$#" -gt 0 ]; then
+  exec "$@"
+fi
 
 exec uvicorn app.main:app \
   --host "${UVICORN_HOST:-0.0.0.0}" \
