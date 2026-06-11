@@ -198,12 +198,12 @@ If your reverse proxy runs in another Docker container instead of on the VPS hos
 
 Example host-level Nginx config:
 
-- [deploy/nginx/api-jachai.rafidahad.me.conf.example](./deploy/nginx/api-jachai.rafidahad.me.conf.example)
+- [deploy/nginx/api.jachai.example.conf.example](./deploy/nginx/api.jachai.example.conf.example)
 
 If you are using the frontend on Vercel or another separate host, set its production backend URL to:
 
 ```env
-BACKEND_API_URL=https://api-jachai.rafidahad.me/api/v1
+BACKEND_API_URL=https://api.jachai.example/api/v1
 ```
 
 ## 7. Useful commands
