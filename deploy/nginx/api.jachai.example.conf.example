@@ -1,7 +1,7 @@
 server {
     listen 80;
     listen [::]:80;
-    server_name api-jachai.rafidahad.me;
+    server_name api.jachai.example;
 
     location / {
         return 301 https://$host$request_uri;
@@ -11,11 +11,11 @@ server {
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name api-jachai.rafidahad.me;
+    server_name api.jachai.example;
 
     # Replace these with your actual certificate paths.
-    ssl_certificate /etc/letsencrypt/live/api-jachai.rafidahad.me/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/api-jachai.rafidahad.me/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/api.jachai.example/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/api.jachai.example/privkey.pem;
 
     client_max_body_size 10m;
 
