@@ -374,21 +374,24 @@ def normalize_tavily_response(response: TavilySearchResponse) -> list[Normalized
     for result in response.results:
         url = normalize_search_url(result.url)
         domain = domain_from_url(url)
-        content = clean_text(result.content or "")
+        tavily_content = clean_text(result.content or "")
+        raw_content = clean_text(result.raw_content or "")
+        content = raw_content or tavily_content
         normalized.append(
             NormalizedSearchResult(
                 query=response.query,
                 title=clean_text(result.title) or url,
                 url=url,
-                snippet=content or None,
+                snippet=tavily_content or content[:320] or None,
                 content=content or None,
                 search_score=result.score,
-                raw_content=result.raw_content,
+                raw_content=raw_content or None,
                 favicon=clean_text(result.favicon or "") or None,
                 request_id=response.request_id,
                 domain=domain,
                 trust_score=trust_score_for_domain(domain),
-                selected_for_crawl=len(content) < MIN_TAVILY_CONTENT_CHARACTERS,
+                selected_for_crawl=settings.live_evidence_crawl_enabled
+                and len(content) < MIN_TAVILY_CONTENT_CHARACTERS,
                 query_list=[response.query],
                 published_date=result.published_date,
             )

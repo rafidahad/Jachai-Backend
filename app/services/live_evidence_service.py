@@ -51,7 +51,7 @@ class LiveEvidenceDocument:
     # New richer fields
     snippet_only: bool = False
     published_date: str | None = None
-    fetch_status: str = "success"  # "success" | "failed" | "snippet_fallback"
+    fetch_status: str = "success"  # "success" | "failed" | "snippet_fallback" | "tavily_only"
     warnings: list[str] = field(default_factory=list)
 
 
@@ -238,8 +238,17 @@ async def _document_from_search_result(
     snippet_only = False
     fetch_status = "success"
     doc_warnings: list[str] = []
+    cleaned_search_answer = clean_text(search_answer or "")
 
-    if len(content) < MIN_TAVILY_CONTENT_CHARACTERS:
+    if len(content) < MIN_TAVILY_CONTENT_CHARACTERS and cleaned_search_answer:
+        answer_context = f"Tavily answer: {cleaned_search_answer}"
+        content = clean_text(
+            "\n\n".join(part for part in [content or snippet, answer_context] if part)
+        )
+        snippet_only = True
+        fetch_status = "tavily_only"
+
+    if settings.live_evidence_crawl_enabled and len(content) < MIN_TAVILY_CONTENT_CHARACTERS:
         result.selected_for_crawl = True
         try:
             crawled_title, crawled_text, crawled_snippet, html_language, crawled_date = (
@@ -262,6 +271,10 @@ async def _document_from_search_result(
             fetch_status = "snippet_fallback"
             doc_warnings.append(f"Full content fetch failed ({exc}); using Tavily snippet.")
             content = clean_text(snippet or "")
+    elif len(content) < settings.live_evidence_min_article_characters:
+        snippet_only = True
+        fetch_status = "tavily_only"
+        content = clean_text(content or snippet or "")
 
     if not content and not snippet:
         return None
