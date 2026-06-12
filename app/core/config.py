@@ -196,6 +196,10 @@ class Settings(BaseSettings):
         default=240,
         validation_alias=AliasChoices("LIVE_EVIDENCE_MIN_ARTICLE_CHARACTERS"),
     )
+    live_evidence_crawl_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("LIVE_EVIDENCE_CRAWL_ENABLED"),
+    )
 
     # ── Evidence pipeline new config ──────────────────────────────────────────
     max_sources_to_fetch: int = Field(
@@ -309,6 +313,7 @@ class Settings(BaseSettings):
         "tavily_include_raw_content",
         "tavily_include_images",
         "live_evidence_enabled",
+        "live_evidence_crawl_enabled",
         "enable_debug_output",
         "auto_create_tables",
         "bootstrap_database_on_startup",

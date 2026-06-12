@@ -577,14 +577,46 @@ class TestEvidenceFetching:
         stream_context.__aenter__.side_effect = httpx.ConnectError("Connection refused")
         mock_client.stream.return_value = stream_context
 
-        doc = await _document_from_search_result(
-            mock_client,
-            result,
-            search_answer=None,
-            search_run_id="test-run",
-        )
+        with patch("app.services.live_evidence_service.settings.live_evidence_crawl_enabled", True):
+            doc = await _document_from_search_result(
+                mock_client,
+                result,
+                search_answer=None,
+                search_run_id="test-run",
+            )
         # Should use snippet fallback, not raise
         assert doc is None or doc.fetch_status == "snippet_fallback"
+
+    @pytest.mark.asyncio
+    async def test_short_tavily_result_uses_answer_without_crawling(self):
+        from app.services.search_service import NormalizedSearchResult
+        from app.services.live_evidence_service import _document_from_search_result
+
+        result = NormalizedSearchResult(
+            query="test",
+            title="Test",
+            url="https://example.com/article",
+            snippet="Short snippet about the claim.",
+            content="Short",
+            search_score=0.7,
+            domain="example.com",
+            trust_score=0.5,
+        )
+
+        mock_client = MagicMock()
+
+        with patch("app.services.live_evidence_service.settings.live_evidence_crawl_enabled", False):
+            doc = await _document_from_search_result(
+                mock_client,
+                result,
+                search_answer="Tavily says the claim is not supported by available reports.",
+                search_run_id="test-run",
+            )
+
+        assert doc is not None
+        assert doc.fetch_status == "tavily_only"
+        assert "Tavily answer" in doc.text_content
+        mock_client.stream.assert_not_called()
 
 
 # ── 6. OCR ───────────────────────────────────────────────────────────────────
