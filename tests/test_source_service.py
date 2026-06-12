@@ -93,6 +93,46 @@ async def test_ingest_sources_skips_reembedding_for_unchanged_content() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ingest_sources_can_skip_embeddings_for_fast_live_evidence() -> None:
+    text = "Tavily answer and source content used directly for live evidence."
+    refreshed = _make_source(
+        url="https://example.com/live",
+        title="Live title",
+        text_content=text,
+        embedding=None,
+        source_meta={"content_hash": normalized_hash(text), "embedding_deferred": True},
+    )
+    session = AsyncMock()
+    session.execute = AsyncMock(side_effect=[_ExecuteResult([]), _ExecuteResult([refreshed])])
+    session.add = MagicMock()
+
+    item = SourceIngestItemSchema(
+        title="Live title",
+        url="https://example.com/live",
+        publisher="Example News",
+        language="English",
+        source_type="tavily_search",
+        snippet="Live source snippet for tests.",
+        text_content=text,
+        metadata={"embedding_deferred": True},
+    )
+
+    with patch("app.services.source_service.embed_texts", new_callable=AsyncMock) as mock_embed:
+        responses, created, updated = await ingest_sources(
+            session,
+            [item],
+            generate_embeddings=False,
+        )
+
+    mock_embed.assert_not_awaited()
+    session.flush.assert_awaited_once()
+    session.commit.assert_awaited_once()
+    assert created == 1
+    assert updated == 0
+    assert responses[0].embedding_available is False
+
+
+@pytest.mark.asyncio
 async def test_ingest_sources_batches_embeddings_for_changed_and_new_sources() -> None:
     existing_text = "Old source text that has since changed."
     changed_text = "Updated source text with corrected details."

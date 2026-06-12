@@ -34,6 +34,8 @@ def to_source_response(source: EvidenceSource) -> SourceResponseSchema:
 async def ingest_sources(
     session: AsyncSession,
     items: list[SourceIngestItemSchema],
+    *,
+    generate_embeddings: bool = True,
 ) -> tuple[list[SourceResponseSchema], int, int]:
     created = 0
     updated = 0
@@ -70,7 +72,9 @@ async def ingest_sources(
             "existing": existing,
             "embedding": None,
         }
-        if existing is None or existing.embedding is None or existing_hash != content_hash:
+        if generate_embeddings and (
+            existing is None or existing.embedding is None or existing_hash != content_hash
+        ):
             items_needing_embeddings.append(prepared)
         prepared_items.append(prepared)
 

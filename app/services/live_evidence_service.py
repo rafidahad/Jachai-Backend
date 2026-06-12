@@ -309,6 +309,7 @@ async def _document_from_search_result(
         "fetch_status": fetch_status,
         "published_date": published_date,
         "doc_warnings": doc_warnings,
+        "embedding_deferred": True,
     }
     return LiveEvidenceDocument(
         title=(clean_text(title) or result.url)[:255],
@@ -527,7 +528,11 @@ async def hydrate_live_evidence(
         )
         for document in selected_documents
     ]
-    items, created_count, updated_count = await ingest_sources(session, ingest_items)
+    items, created_count, updated_count = await ingest_sources(
+        session,
+        ingest_items,
+        generate_embeddings=False,
+    )
 
     # Build evidence_documents list for evidence_chunker
     evidence_documents: list[dict[str, Any]] = []
